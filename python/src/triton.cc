@@ -1580,6 +1580,10 @@ void init_triton_ir(py::module &&m) {
            [](mlir::PassManager &self) {
              self.addPass(mlir::triton::createReorderBroadcastPass());
            })
+      .def("propagate_hints_pass",
+           [](mlir::PassManager &self) {
+             self.addPass(mlir::triton::createPropagateHintsPass());
+           })
       .def("add_rewrite_tensor_pointer_pass",
            [](mlir::PassManager &self, int computeCapability) {
              self.addPass(mlir::triton::createRewriteTensorPointerPass(

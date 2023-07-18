@@ -47,4 +47,15 @@ def TritonRewriteTensorPointer : Pass</*cli-arg*/"triton-rewrite-tensor-pointer"
   ];
 }
 
+def TritonPropagateHints : Pass</*cli-arg*/"triton-propagate-hints", /*Op*/"mlir::ModuleOp"> {
+  let summary = "Propagate hints like contiguity, constancy, and divisibility";
+  let description = [{
+    Propagates hints, TODO fill this out more.
+  }];
+
+  let constructor = "mlir::triton::createPropagateHintsPass()";
+
+  let dependentDialects = ["mlir::triton::TritonDialect"];
+}
+
 #endif

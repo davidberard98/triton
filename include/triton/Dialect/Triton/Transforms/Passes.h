@@ -13,6 +13,8 @@ std::unique_ptr<Pass> createReorderBroadcastPass();
 std::unique_ptr<Pass>
 createRewriteTensorPointerPass(int computeCapability = 80);
 
+std::unique_ptr<Pass> createPropagateHintsPass();
+
 } // namespace triton
 
 #define GEN_PASS_REGISTRATION

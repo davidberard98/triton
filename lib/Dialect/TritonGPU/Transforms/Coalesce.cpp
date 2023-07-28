@@ -28,6 +28,7 @@ struct CoalescePass : public TritonGPUCoalesceBase<CoalescePass> {
     // Get the shape of the tensor.
     size_t rank = origType.getRank();
     // Get the contiguity order of `ptr`
+    auto contiguity = axisInfoAnalysis.getAxisInfo(ptr)->getContiguity();
     auto order = argSort(axisInfoAnalysis.getAxisInfo(ptr)->getContiguity());
     // The desired divisibility is the maximum divisibility
     // among all dependent pointers who have the same order as
@@ -37,7 +38,8 @@ struct CoalescePass : public TritonGPUCoalesceBase<CoalescePass> {
     if (ptr.getDefiningOp())
       for (Operation *op : mlir::multiRootGetSlice(ptr.getDefiningOp())) {
         for (Value val : op->getResults()) {
-          if (val.getType() != origType)
+          // if (val.getType() != origType)
+          if (!isa<RankedTensorType>(val.getType()) || val.getType().cast<RankedTensorType>().getShape() != origType.getShape())
             continue;
           auto currOrder =
               argSort(axisInfoAnalysis.getAxisInfo(val)->getContiguity());
@@ -50,7 +52,7 @@ struct CoalescePass : public TritonGPUCoalesceBase<CoalescePass> {
     int numElemsPerThread = std::max(numElems / numThreads, 1);
     // Thread tile size depends on memory alignment
     SmallVector<unsigned, 4> sizePerThread(rank, 1);
-    unsigned elemNumBits = triton::getPointeeBitWidth(origType);
+    unsigned elemNumBits = 16; // triton::getPointeeBitWidth(origType);
     unsigned elemNumBytes = std::max(elemNumBits / 8, 1u);
     unsigned perThread = 1;
     for (Value val : withSameOrder) {
@@ -126,6 +128,7 @@ struct CoalescePass : public TritonGPUCoalesceBase<CoalescePass> {
   void runOnOperation() override {
     // Run axis info analysis
     ModuleOp moduleOp = getOperation();
+    moduleOp.dump();
     ModuleAxisInfoAnalysis axisInfoAnalysis(moduleOp);
 
     // For each i/o operation, we determine what layout
@@ -188,6 +191,7 @@ struct CoalescePass : public TritonGPUCoalesceBase<CoalescePass> {
         return;
       }
     });
+    moduleOp.dump();
   }
 };
 

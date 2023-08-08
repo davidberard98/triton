@@ -1,9 +1,13 @@
 #include "mlir/Analysis/SliceAnalysis.h"
+#include "mlir/IR/PatternMatch.h"
+#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "triton/Analysis/AxisInfo.h"
 #include "triton/Analysis/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
 #include <numeric>
+
+#include <iostream>
 
 using namespace mlir;
 using namespace mlir::triton;
@@ -20,6 +24,67 @@ template <class T> SmallVector<unsigned, 4> argSort(const T &arr) {
 }
 
 typedef DenseMap<Value, std::function<Type(Type)>> LayoutMap;
+
+class MaximizeCoalescePattern : public RewritePattern {
+public:
+  explicit MaximizeCoalescePattern(MLIRContext* context, unsigned numWarps, unsigned threadsPerWarp) : RewritePattern(MatchAnyOpTypeTag(), /*benefit=*/1, context), numWarps(numWarps), threadsPerWarp(threadsPerWarp) {}
+
+  LogicalResult matchAndRewrite(Operation* op, PatternRewriter& rewriter) const override {
+    exit(-1);
+    op->emitWarning() << " MATCH AND REWRITE -. ";
+    for (const Value& result : op->getResults()) {
+      auto rttType = result.getType().cast<RankedTensorType>();
+      if (!rttType) {
+        std::cerr << " Did not match " << std::endl;
+        return failure();
+      }
+      if (!rttType.getEncoding().isa<triton::gpu::BlockedEncodingAttr>()) {
+        std::cerr << " Did not match encoding " << std::endl;
+        return failure();
+      }
+    }
+
+    std::cout << "  will replace.. " << std::endl;
+
+    SmallVector<Type, 4> newReturnTypes;
+    for (const Value& result : op->getResults()) {
+      auto rttType = result.getType().cast<RankedTensorType>();
+      auto encoding = rttType.getEncoding().cast<triton::gpu::BlockedEncodingAttr>();
+      ArrayRef<int64_t> shape = rttType.getShape();
+      int rank = shape.size();
+
+      llvm::SmallVector<unsigned, 4> order(rank);
+      std::iota(order.rbegin(), order.rend(), 0);
+      llvm::SmallVector<unsigned> sizePerThread(rank, 1);
+
+      while (shape[rank-1] < sizePerThread[rank-1]) {
+        sizePerThread[rank-1] *= 2;
+      }
+      std::cout << " Now with size " << sizePerThread[rank-1] << std::endl;
+
+      auto newEncoding = triton::gpu::BlockedEncodingAttr::get(
+        getContext(), shape, sizePerThread, order, numWarps, threadsPerWarp);
+      auto newType = RankedTensorType::get(shape, rttType.getElementType(), encoding);
+
+      newReturnTypes.push_back(newType);
+    }
+
+    OperationState newState(op->getLoc(), op->getName());
+    newState.addOperands(op->getOperands());
+    newState.addTypes(std::move(newReturnTypes));
+    newState.addAttributes(op->getAttrs());
+
+    Operation* newOp = rewriter.create(newState);
+    rewriter.replaceOp(op, newOp->getResults());
+    std::cout << "Successfully replaced " << op->getName().getStringRef().str() << std::endl;
+
+    return success();
+  }
+
+private:
+  unsigned numWarps;
+  unsigned threadsPerWarp;
+};
 
 struct CoalescePass : public TritonGPUCoalesceBase<CoalescePass> {
   Attribute getCoalescedEncoding(ModuleAxisInfoAnalysis &axisInfoAnalysis,
@@ -124,8 +189,26 @@ struct CoalescePass : public TritonGPUCoalesceBase<CoalescePass> {
   }
 
   void runOnOperation() override {
+    std::cout << " RUN ON OPERATION - COALESCE " << std::endl;
     // Run axis info analysis
     ModuleOp moduleOp = getOperation();
+
+    int numWarps = triton::gpu::TritonGPUDialect::getNumWarps(moduleOp);
+    int threadsPerWarp =
+        triton::gpu::TritonGPUDialect::getThreadsPerWarp(moduleOp);
+
+    MLIRContext *context = &getContext();
+    RewritePatternSet patterns(context);
+    patterns.add<MaximizeCoalescePattern>(context, numWarps, threadsPerWarp);
+
+    Region region(moduleOp);
+    moduleOp.dump();
+    if (applyPatternsAndFoldGreedily(region, std::move(patterns)).failed()) {
+      std::cerr << " patternsAndFoldGreedily failed" << std::endl;
+      return signalPassFailure();
+    }
+    moduleOp.dump();
+
     ModuleAxisInfoAnalysis axisInfoAnalysis(moduleOp);
 
     // For each i/o operation, we determine what layout

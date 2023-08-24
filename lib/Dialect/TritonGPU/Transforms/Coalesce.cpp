@@ -55,28 +55,75 @@ RankedTensorType maximizeContiguousShape(
   return newType;
 }
 
-class MaximizeCoalesceOp {
+class MaximizeCoalesceSupportedState {
 public:
-  virtual LogicalResult matchAndRewrite(Operation* op, PatternRewriter& rewriter, MLIRContext* context, unsigned numWarps, unsigned threadsPerWarp) = 0;
-  virtual bool matchOp(Operation* op) = 0;
+  void addShape(ArrayRef<int64_t> shape) { shapes.insert(std::move(shape)); }
+  int uniqueShapes() const {
+    return shapes.size();
+  }
+  void markUnsupported() {
+    supported = false;
+  }
+  bool isSupported() const {
+    return supported;
+  }
+private:
+  SetVector<ArrayRef<int64_t>> shapes;
+  bool supported{true};
+};
+
+class MaximizeCoalesceOpHandler {
+public:
+  MaximizeCoalesceOpHandler() = default;
+  virtual ~MaximizeCoalesceOpHandler() = default;
+  virtual LogicalResult matchAndRewrite(Operation* op, PatternRewriter& rewriter, MLIRContext* context, unsigned numWarps, unsigned threadsPerWarp) const = 0;
+  virtual bool matchOp(Operation* op) const = 0;
+  virtual bool supported(Operation* op, MaximizeCoalesceSupportedState& state) const = 0;
 };
 
 template <typename OpTy>
-class MaximizeCoalesceOpImpl : public MaximizeCoalesceOp {
+class MaximizeCoalesceOpHandlerImpl : public MaximizeCoalesceOpHandler {
 public:
+  MaximizeCoalesceOpHandlerImpl() = default;
+  virtual ~MaximizeCoalesceOpHandlerImpl() = default;
+
   // TODO(dberard): split matchAndRewrite to match / rewrite.
   //   Benefit: we can use it as part of the initial "can we rewrite?" check...
-  LogicalResult matchAndRewrite(Operation* op, PatternRewriter& rewriter, MLIRContext* context, unsigned numWarps, unsigned threadsPerWarp) override final {
+  LogicalResult matchAndRewrite(Operation* op, PatternRewriter& rewriter, MLIRContext* context, unsigned numWarps, unsigned threadsPerWarp) const override {
     return matchAndRewriteImpl(cast<OpTy>(op), rewriter, context, numWarps, threadsPerWarp);
   }
-  bool matchOp(Operation* op) override final {
+  virtual LogicalResult matchAndRewriteImpl(OpTy op, PatternRewriter& rewriter, MLIRContext* context, unsigned numWarps, unsigned threadsPerWarp) const = 0;
+  bool matchOp(Operation* op) const override final {
     return isa<OpTy>(op);
   }
-  virtual LogicalResult matchAndRewriteImpl(OpTy op, PatternRewriter& rewriter, MLIRContext* context, unsigned numWarps, unsigned threadsPerWarp) = 0;
+  bool supported(Operation* op, MaximizeCoalesceSupportedState& state) const override {
+    for (const Value& result : op->getResults()) {
+      if (result.getType().template dyn_cast<PointerType>()) {
+        return false; // block pointer not supported
+      }
+      if (!result.getType().template dyn_cast<TensorType>()) {
+        continue; // ignore scalar types
+      }
+      auto type = result.getType().template dyn_cast<RankedTensorType>();
+      if (!type) {
+        std::cerr << "   fails: not RankedTensorType" << std::endl;
+        return false;
+      }
+      auto encoding = type.getEncoding().template dyn_cast<triton::gpu::BlockedEncodingAttr>();
+      if (!encoding) {
+        std::cerr << "   fails: not BlockedEncodingAttr" << std::endl;
+        return false;
+      }
+      // For simplicity, only support graphs where all tensors have the same shape
+      state.addShape(type.getShape());
+    }
+    return supportedImpl(cast<OpTy>(op));
+  }
+  virtual bool supportedImpl(OpTy op) const = 0;
 };
 
-class MaximizeCoalesceConstantOp : public MaximizeCoalesceOpImpl<arith::ConstantOp> {
-  LogicalResult matchAndRewriteImpl(arith::ConstantOp op, PatternRewriter& rewriter, MLIRContext* context, unsigned numWarps, unsigned threadsPerWarp) override final {
+class MaximizeCoalesceConstantOp : public MaximizeCoalesceOpHandlerImpl<arith::ConstantOp> {
+  LogicalResult matchAndRewriteImpl(arith::ConstantOp op, PatternRewriter& rewriter, MLIRContext* context, unsigned numWarps, unsigned threadsPerWarp) const override final {
     // TODO(dberard): unify origType / oldType naming scheme...
     auto origType = op.getResult().getType().dyn_cast<RankedTensorType>();
     if (!origType) {
@@ -109,25 +156,19 @@ class MaximizeCoalesceConstantOp : public MaximizeCoalesceOpImpl<arith::Constant
     auto newOp = rewriter.replaceOpWithNewOp<arith::ConstantOp>(op, newShapedType, value);
     return success();
   }
+
+  bool supportedImpl(arith::ConstantOp op) const override final {
+    return true;
+  }
 };
 
-class MaximizeCoalescePattern : public RewritePattern {
-public:
-  explicit MaximizeCoalescePattern(MLIRContext* context, unsigned numWarps, unsigned threadsPerWarp) : RewritePattern(MatchAnyOpTypeTag(), /*benefit=*/1, context), numWarps(numWarps), threadsPerWarp(threadsPerWarp) {
-    visitors.push_back(std::make_unique<MaximizeCoalesceConstantOp>());
-  }
-
-  LogicalResult matchAndRewrite(Operation* op, PatternRewriter& rewriter) const override {
-    std::cerr << "Handling " << op << std::endl;
-    for (auto& visitor : visitors) {
-      if (visitor->matchOp(op)) {
-        std::cerr << "  op is handled specially!" << std::endl;
-        return visitor->matchAndRewrite(op, rewriter, getContext(), numWarps, threadsPerWarp);
-      }
-    }
-    if (op->getResults().size() != 1) {
+template<typename OpTy>
+class MaximizeCoalesceSupported : public MaximizeCoalesceOpHandler {
+  LogicalResult matchAndRewrite(Operation* op, PatternRewriter& rewriter, MLIRContext* context, unsigned numWarps, unsigned threadsPerWarp) const override final {
+    if (op->getResults().size() == 0) {
       return failure();
     }
+    assert(op->getResults().size() == 1 && "Expected only 1 result from this op");
     const auto& oldResult = op->getResults()[0];
     auto rttType = oldResult.getType().dyn_cast<RankedTensorType>();
     if (!rttType) {
@@ -138,7 +179,7 @@ public:
       return failure();
     }
 
-    auto newType = maximizeContiguousShape(rttType, getContext(), numWarps, threadsPerWarp);
+    auto newType = maximizeContiguousShape(rttType, context, numWarps, threadsPerWarp);
 
     SmallVector<Type, 1> newReturnTypes;
     newReturnTypes.push_back(std::move(newType));
@@ -168,10 +209,84 @@ public:
 
     return success();
   }
+  bool matchOp(Operation* op) const override final {
+    return isa<OpTy>(op);
+  }
+  bool supported(Operation* op, MaximizeCoalesceSupportedState& state) const override final {
+    return (op->getResults().size() <= 1);
+  }
+};
+
+template<typename OpTy>
+class MaximizeCoalesceUnsupported : public MaximizeCoalesceOpHandlerImpl<OpTy> {
+  LogicalResult matchAndRewriteImpl(Operation* op, PatternRewriter& rewriter, MLIRContext* context, unsigned numWarps, unsigned threadsPerWarp) const override final {
+    return failure();
+  }
+
+  bool supportedImpl(Operation* op) const override final {
+    return false;
+  }
+};
+
+// TODO: currently not used. Maybe remove it.
+template<typename OpTy>
+class MaximizeCoalesceNoOp : public MaximizeCoalesceOpHandler {
+  LogicalResult matchAndRewrite(Operation*, PatternRewriter&, MLIRContext*, unsigned, unsigned) const override final {
+    return failure();
+  }
+  bool matchOp(Operation* op) const override final {
+    return isa<OpTy>(op);
+  }
+  bool supported(Operation*, MaximizeCoalesceSupportedState&) const override final {
+    return true;
+  }
+};
+
+class MaximizeCoalesceOpHandlerList {
+public:
+  template<typename T>
+  void append() {
+    // TODO rename
+    visitors.push_back(std::make_unique<T>());
+  }
+
+  bool supported(Operation* op, MaximizeCoalesceSupportedState& state) const {
+    for (const auto& visitor : visitors) {
+      if (visitor->matchOp(op)) {
+        return visitor->supported(op, state);
+      }
+    }
+    // TODO make it default to just "false"
+    // llvm_unreachable(("No handler for " + op->getName().getStringRef()).str().c_str());
+    std::cerr << " ! Unsupported op " << op->getName().getStringRef().str() << std::endl;
+    return false;
+  }
+
+  LogicalResult matchAndRewrite(Operation* op, PatternRewriter& rewriter, MLIRContext* context, unsigned numWarps, unsigned threadsPerWarp) const {
+    for (const auto& visitor : visitors) {
+      if (visitor->matchOp(op)) {
+        return visitor->matchAndRewrite(op, rewriter, context, numWarps, threadsPerWarp);
+      }
+    }
+    llvm_unreachable(("No matchAndRewrite handler for " + op->getName().getStringRef()).str().c_str());
+  }
+private:
+  std::vector<std::unique_ptr<MaximizeCoalesceOpHandler>> visitors;
+};
+
+class MaximizeCoalescePattern : public RewritePattern {
+public:
+  explicit MaximizeCoalescePattern(MLIRContext* context, MaximizeCoalesceOpHandlerList handlers, unsigned numWarps, unsigned threadsPerWarp) : RewritePattern(MatchAnyOpTypeTag(), /*benefit=*/1, context), handlers(std::move(handlers)), numWarps(numWarps), threadsPerWarp(threadsPerWarp) {
+  }
+
+  LogicalResult matchAndRewrite(Operation* op, PatternRewriter& rewriter) const override {
+    std::cerr << "Handling " << op << std::endl;
+    return handlers.matchAndRewrite(op, rewriter, getContext(), numWarps, threadsPerWarp);
+  }
 private:
   unsigned numWarps;
   unsigned threadsPerWarp;
-  std::vector<std::unique_ptr<MaximizeCoalesceOp>> visitors; // TODO rename
+  MaximizeCoalesceOpHandlerList handlers; // TODO rename
 };
 
 struct CoalescePass : public TritonGPUCoalesceBase<CoalescePass> {
@@ -384,24 +499,78 @@ struct CoalescePass : public TritonGPUCoalesceBase<CoalescePass> {
     op->erase();
   }
 
+  // TODO docstring
+  void tryResetDefaultEncoding(ModuleOp& moduleOp) {
+    int numWarps = triton::gpu::TritonGPUDialect::getNumWarps(moduleOp);
+    int threadsPerWarp =
+        triton::gpu::TritonGPUDialect::getThreadsPerWarp(moduleOp);
+
+    MaximizeCoalesceOpHandlerList handlers;
+    handlers.append<MaximizeCoalesceConstantOp>();
+    handlers.append<MaximizeCoalesceSupported<arith::MulIOp>>();
+    handlers.append<MaximizeCoalesceSupported<arith::AddIOp>>();
+    handlers.append<MaximizeCoalesceSupported<arith::SubIOp>>();
+    handlers.append<MaximizeCoalesceSupported<arith::AndIOp>>();
+    handlers.append<MaximizeCoalesceSupported<arith::DivSIOp>>();
+    handlers.append<MaximizeCoalesceSupported<arith::DivUIOp>>();
+    handlers.append<MaximizeCoalesceSupported<arith::RemSIOp>>();
+    handlers.append<MaximizeCoalesceSupported<arith::RemUIOp>>();
+    handlers.append<MaximizeCoalesceSupported<arith::ExtFOp>>();
+    handlers.append<MaximizeCoalesceSupported<arith::TruncFOp>>();
+    handlers.append<MaximizeCoalesceSupported<triton::AddPtrOp>>();
+    handlers.append<MaximizeCoalesceSupported<triton::FuncOp>>();
+    handlers.append<MaximizeCoalesceSupported<triton::GetProgramIdOp>>();
+    handlers.append<MaximizeCoalesceSupported<triton::LoadOp>>();
+    handlers.append<MaximizeCoalesceSupported<triton::MakeRangeOp>>();
+    handlers.append<MaximizeCoalesceSupported<triton::ReturnOp>>();
+    handlers.append<MaximizeCoalesceSupported<triton::SplatOp>>();
+    handlers.append<MaximizeCoalesceSupported<triton::StoreOp>>();
+    handlers.append<MaximizeCoalesceSupported<triton::gpu::CmpIOp>>();
+    handlers.append<MaximizeCoalesceSupported<triton::gpu::SelectOp>>();
+    handlers.append<MaximizeCoalesceSupported<ModuleOp>>();
+
+    // handlers.append<MaximizeCoalesceNoOp<triton::FuncOp>>();
+    // handlers.append<MaximizeCoalesceNoOp<ModuleOp>>();
+
+    // handlers.append<MaximizeCoalesceUnsupported<triton::>>();
+
+    MaximizeCoalesceSupportedState state;
+
+    moduleOp.walk([&](Operation* curr) {
+      if (!handlers.supported(curr, state)) {
+        std::cerr << " Unsupported op instance: " << curr->getName().getStringRef().str() << std::endl;
+        state.markUnsupported();
+      }
+    });
+
+    if (!state.isSupported()) {
+      return;
+    }
+
+    // TODO: add this
+    // if (state.uniqueShapes() > 1) {
+    //   return;
+    // }
+
+    MLIRContext *context = &getContext();
+    RewritePatternSet patterns(context);
+    patterns.add<MaximizeCoalescePattern>(context, std::move(handlers), numWarps, threadsPerWarp);
+
+    if (applyPatternsAndFoldGreedily(moduleOp, std::move(patterns)).failed()) {
+      std::cerr << " applyPatternsAndFoldGreedily failed" << std::endl;
+      return signalPassFailure();
+    } else {
+      std::cerr << " Success! " << std::endl;
+    }
+    moduleOp.dump();
+  }
+
   void runOnOperation() override {
     // Run axis info analysis
     ModuleOp moduleOp = getOperation();
     std::cerr << " runOnOperation: Coalesce, want to apply MaximizeCoalescePattern" << std::endl;
 
-    int numWarps = triton::gpu::TritonGPUDialect::getNumWarps(moduleOp);
-    int threadsPerWarp =
-        triton::gpu::TritonGPUDialect::getThreadsPerWarp(moduleOp);
-
-    MLIRContext *context = &getContext();
-    RewritePatternSet patterns(context);
-    patterns.add<MaximizeCoalescePattern>(context, numWarps, threadsPerWarp);
-
-    if (applyPatternsAndFoldGreedily(moduleOp, std::move(patterns)).failed()) {
-      std::cerr << " applyPatternsAndFoldGreedily failed" << std::endl;
-      return signalPassFailure();
-    }
-    moduleOp.dump();
+    tryResetDefaultEncoding(moduleOp);
 
     ModuleAxisInfoAnalysis axisInfoAnalysis(moduleOp);
 

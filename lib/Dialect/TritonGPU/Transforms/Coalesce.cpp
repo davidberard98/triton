@@ -27,7 +27,32 @@ template <class T> SmallVector<unsigned, 4> argSort(const T &arr) {
 
 typedef DenseMap<Value, std::pair<std::function<Type(Type)>, std::function<bool(Type)>>> LayoutMap;
 
+// This is the info used to generate the best "default layout".
+struct MaximizeCoalesceShapeInfo {
+  ArrayRef<int64_t> shape;
+  ArrayRef<unsigned> order;
+
+  bool operator== (const MaximizeCoalesceShapeInfo& other) const {
+    return shape == other.shape && order == other.order;
+  }
+};
+
+template<>
+struct llvm::DenseMapInfo<MaximizeCoalesceShapeInfo> {
+  static MaximizeCoalesceShapeInfo getEmptyKey() { return {{}, {}}; }
+  static MaximizeCoalesceShapeInfo getTombstoneKey() { return {{-1}, {unsigned(-1)}}; }
+  static unsigned getHashValue(const MaximizeCoalesceShapeInfo& value) {
+    unsigned shapeHash = DenseMapInfo<ArrayRef<int64_t>>::getHashValue(value.shape);
+    unsigned orderHash = DenseMapInfo<ArrayRef<unsigned>>::getHashValue(value.order);
+    return DenseMapInfo<std::pair<unsigned, unsigned>>::getHashValue({shapeHash, orderHash});
+  }
+  static bool isEqual(const MaximizeCoalesceShapeInfo& lhs, const MaximizeCoalesceShapeInfo& rhs) {
+    return lhs == rhs;
+  }
+};
+
 // TODO better name
+// TODO: calculate this once instead of for each conversion...
 RankedTensorType maximizeContiguousShape(
   RankedTensorType origType,
   MLIRContext* context,
@@ -57,9 +82,9 @@ RankedTensorType maximizeContiguousShape(
 
 class MaximizeCoalesceSupportedState {
 public:
-  void addShape(ArrayRef<int64_t> shape) { shapes.insert(std::move(shape)); }
+  void addShapeInfo(MaximizeCoalesceShapeInfo shapeInfo) { shapeInfos.insert(std::move(shapeInfo)); }
   int uniqueShapes() const {
-    return shapes.size();
+    return shapeInfos.size();
   }
   void markUnsupported() {
     supported = false;
@@ -68,7 +93,7 @@ public:
     return supported;
   }
 private:
-  SetVector<ArrayRef<int64_t>> shapes;
+  SetVector<MaximizeCoalesceShapeInfo> shapeInfos;
   bool supported{true};
 };
 
@@ -115,7 +140,7 @@ public:
         return false;
       }
       // For simplicity, only support graphs where all tensors have the same shape
-      state.addShape(type.getShape());
+      state.addShapeInfo({type.getShape(), encoding.getOrder()});
     }
     return supportedImpl(cast<OpTy>(op));
   }
@@ -162,8 +187,7 @@ class MaximizeCoalesceConstantOp : public MaximizeCoalesceOpHandlerImpl<arith::C
   }
 };
 
-template<typename OpTy>
-class MaximizeCoalesceSupported : public MaximizeCoalesceOpHandler {
+class MaximizeCoalesceGeneric : public MaximizeCoalesceOpHandler {
   LogicalResult matchAndRewrite(Operation* op, PatternRewriter& rewriter, MLIRContext* context, unsigned numWarps, unsigned threadsPerWarp) const override final {
     if (op->getResults().size() == 0) {
       return failure();
@@ -209,8 +233,8 @@ class MaximizeCoalesceSupported : public MaximizeCoalesceOpHandler {
 
     return success();
   }
-  bool matchOp(Operation* op) const override final {
-    return isa<OpTy>(op);
+  bool matchOp(Operation* op) const override {
+    llvm_unreachable("matchOp not supported on MaximizeCoalesceGeneric");
   }
   bool supported(Operation* op, MaximizeCoalesceSupportedState& state) const override final {
     return (op->getResults().size() <= 1);
@@ -218,12 +242,40 @@ class MaximizeCoalesceSupported : public MaximizeCoalesceOpHandler {
 };
 
 template<typename OpTy>
+class MaximizeCoalesceSupported : public MaximizeCoalesceGeneric {
+  bool matchOp(Operation* op) const override final {
+    return isa<OpTy>(op);
+  }
+};
+
+class MaximizeCoalesceArithOps : public MaximizeCoalesceGeneric {
+  bool matchOp(Operation* op) const override final {
+    // ConstantOp needs special handling for its value.
+    return op->getName().getDialect()->getNamespace() == "arith" && !isa<arith::ConstantOp>(op);
+  }
+};
+
+class MaximizeCoalesceMathOps : public MaximizeCoalesceGeneric {
+  bool matchOp(Operation* op) const override final {
+    // ConstantOp needs special handling for its value.
+    return op->getName().getDialect()->getNamespace() == "math" && op->hasTrait<OpTrait::SameOperandsAndResultType>();
+  }
+};
+
+class MaximizeCoalesceSameOpResultEncoding : public MaximizeCoalesceGeneric {
+  bool matchOp(Operation* op) const override final {
+    return op->hasTrait<OpTrait::SameOperandsAndResultEncoding>()
+        && op->hasTrait<OpTrait::SameOperandsAndResultShape>();
+  }
+};
+
+template<typename OpTy>
 class MaximizeCoalesceUnsupported : public MaximizeCoalesceOpHandlerImpl<OpTy> {
-  LogicalResult matchAndRewriteImpl(Operation* op, PatternRewriter& rewriter, MLIRContext* context, unsigned numWarps, unsigned threadsPerWarp) const override final {
+  LogicalResult matchAndRewriteImpl(OpTy op, PatternRewriter& rewriter, MLIRContext* context, unsigned numWarps, unsigned threadsPerWarp) const override final {
     return failure();
   }
 
-  bool supportedImpl(Operation* op) const override final {
+  bool supportedImpl(OpTy op) const override final {
     return false;
   }
 };
@@ -507,17 +559,24 @@ struct CoalescePass : public TritonGPUCoalesceBase<CoalescePass> {
 
     MaximizeCoalesceOpHandlerList handlers;
     handlers.append<MaximizeCoalesceConstantOp>();
-    handlers.append<MaximizeCoalesceSupported<arith::MulIOp>>();
-    handlers.append<MaximizeCoalesceSupported<arith::AddIOp>>();
-    handlers.append<MaximizeCoalesceSupported<arith::SubIOp>>();
-    handlers.append<MaximizeCoalesceSupported<arith::AndIOp>>();
-    handlers.append<MaximizeCoalesceSupported<arith::DivSIOp>>();
-    handlers.append<MaximizeCoalesceSupported<arith::DivUIOp>>();
-    handlers.append<MaximizeCoalesceSupported<arith::RemSIOp>>();
-    handlers.append<MaximizeCoalesceSupported<arith::RemUIOp>>();
-    handlers.append<MaximizeCoalesceSupported<arith::ExtFOp>>();
-    handlers.append<MaximizeCoalesceSupported<arith::TruncFOp>>();
+    // TODO: arith - make a rule for MaximizedSupportedArith
+    //       which has default behavior EXCEPT for constant op
+    //       op->getName().getDialect().... something
+    // TODO: clean this up, e.g. maybe just pass lambdas...
+    handlers.append<MaximizeCoalesceArithOps>();
+    handlers.append<MaximizeCoalesceMathOps>();
+    handlers.append<MaximizeCoalesceSameOpResultEncoding>();
+    handlers.append<MaximizeCoalesceSupported<::mlir::gpu::BarrierOp>>();
+    handlers.append<MaximizeCoalesceSupported<scf::ConditionOp>>();
+    handlers.append<MaximizeCoalesceSupported<scf::ForOp>>();
+    handlers.append<MaximizeCoalesceSupported<scf::IfOp>>();
+    handlers.append<MaximizeCoalesceSupported<scf::WhileOp>>();
+    handlers.append<MaximizeCoalesceSupported<scf::YieldOp>>();
     handlers.append<MaximizeCoalesceSupported<triton::AddPtrOp>>();
+    handlers.append<MaximizeCoalesceSupported<triton::AssertOp>>();
+    handlers.append<MaximizeCoalesceSupported<triton::AtomicRMWOp>>();
+    handlers.append<MaximizeCoalesceSupported<triton::BitcastOp>>();
+    handlers.append<MaximizeCoalesceSupported<triton::ExternElementwiseOp>>();
     handlers.append<MaximizeCoalesceSupported<triton::FuncOp>>();
     handlers.append<MaximizeCoalesceSupported<triton::GetProgramIdOp>>();
     handlers.append<MaximizeCoalesceSupported<triton::LoadOp>>();
@@ -525,6 +584,7 @@ struct CoalescePass : public TritonGPUCoalesceBase<CoalescePass> {
     handlers.append<MaximizeCoalesceSupported<triton::ReturnOp>>();
     handlers.append<MaximizeCoalesceSupported<triton::SplatOp>>();
     handlers.append<MaximizeCoalesceSupported<triton::StoreOp>>();
+    handlers.append<MaximizeCoalesceSupported<triton::gpu::CmpFOp>>();
     handlers.append<MaximizeCoalesceSupported<triton::gpu::CmpIOp>>();
     handlers.append<MaximizeCoalesceSupported<triton::gpu::SelectOp>>();
     handlers.append<MaximizeCoalesceSupported<ModuleOp>>();
@@ -532,13 +592,17 @@ struct CoalescePass : public TritonGPUCoalesceBase<CoalescePass> {
     // handlers.append<MaximizeCoalesceNoOp<triton::FuncOp>>();
     // handlers.append<MaximizeCoalesceNoOp<ModuleOp>>();
 
-    // handlers.append<MaximizeCoalesceUnsupported<triton::>>();
+    handlers.append<MaximizeCoalesceUnsupported<triton::BroadcastOp>>();
+    handlers.append<MaximizeCoalesceUnsupported<triton::ExpandDimsOp>>();
+    handlers.append<MaximizeCoalesceUnsupported<triton::ReduceOp>>();
+    handlers.append<MaximizeCoalesceUnsupported<triton::ReduceReturnOp>>();
+    handlers.append<MaximizeCoalesceUnsupported<triton::gpu::ConvertLayoutOp>>();
 
     MaximizeCoalesceSupportedState state;
 
     moduleOp.walk([&](Operation* curr) {
       if (!handlers.supported(curr, state)) {
-        std::cerr << " Unsupported op instance: " << curr->getName().getStringRef().str() << std::endl;
+        // std::cerr << " Unsupported op instance: " << curr->getName().getStringRef().str() << std::endl;
         state.markUnsupported();
       }
     });
@@ -547,10 +611,9 @@ struct CoalescePass : public TritonGPUCoalesceBase<CoalescePass> {
       return;
     }
 
-    // TODO: add this
-    // if (state.uniqueShapes() > 1) {
-    //   return;
-    // }
+    if (state.uniqueShapes() > 1) {
+      return;
+    }
 
     MLIRContext *context = &getContext();
     RewritePatternSet patterns(context);

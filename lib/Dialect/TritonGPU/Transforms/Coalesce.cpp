@@ -21,10 +21,19 @@ template <class T> SmallVector<unsigned, 4> argSort(const T &arr) {
   return ret;
 }
 
-typedef DenseMap<Value, std::function<Type(Type)>> LayoutMap;
+// In order to coalesce memory accesses, we might require a certain ordering
+// and a minimum sizePerThread along that dimension.
+struct CoalesceConstraint {
+  SmallVector<unsigned> order;
+  // Requested value of encoding.sizePerThread[order[0]]
+  int64_t sizePerThread;
+};
+
+// typedef DenseMap<Value, std::function<Type(Type)>> LayoutMap;
+typedef DenseMap<Value, std::optional<CoalesceConstraint>> LayoutMap;
 
 struct CoalescePass : public TritonGPUCoalesceBase<CoalescePass> {
-  Attribute getCoalescedEncoding(ModuleAxisInfoAnalysis &axisInfoAnalysis,
+  std::optional<CoalesceConstraint> getCoalescedConstraint(ModuleAxisInfoAnalysis &axisInfoAnalysis,
                                  Value ptr, int numWarps, int threadsPerWarp) {
     auto refType = ptr.getType();
     if (refType.isa<PointerType>())
@@ -71,7 +80,14 @@ struct CoalescePass : public TritonGPUCoalesceBase<CoalescePass> {
                 makeTensorPtr.getOrder().end(), std::back_inserter(order));
     } else {
       // Normal cases
-      order = argSort(queryAxisInfo(ptr).getContiguity());
+
+      // If there are no known contiguity properties, this value shouldn't
+      // require any ordering, to avoid forcing any ordering.
+      const auto& contiguity = queryAxisInfo(ptr).getContiguity();
+      if (!std::any_of(contiguity.begin(), contiguity.end(), [](int64_t x) {return x>1;})) {
+        return std::nullopt;
+      }
+      order = argSort(contiguity);
     }
 
     // The desired divisibility is the maximum divisibility
@@ -108,7 +124,6 @@ struct CoalescePass : public TritonGPUCoalesceBase<CoalescePass> {
                           : refTensorType.getElementType();
 
     // Thread tile size depends on memory alignment
-    SmallVector<unsigned, 4> sizePerThread(refTensorType.getRank(), 1);
     unsigned elemNumBits = typeForMem.getIntOrFloatBitWidth();
     unsigned elemNumBytes = std::max(elemNumBits / 8, 1u);
     unsigned perThread = 1;
@@ -122,29 +137,60 @@ struct CoalescePass : public TritonGPUCoalesceBase<CoalescePass> {
       unsigned currPerThread = std::min(alignment, 128 / elemNumBits);
       perThread = std::max(perThread, currPerThread);
     }
-    sizePerThread[order[0]] = std::min<int>(perThread, numElemsPerThread);
+    auto constraint = std::min<int>(perThread, numElemsPerThread);
+    return CoalesceConstraint{order, constraint};
+  }
+
+  Attribute getCoalescedEncoding(Value ptr, const CoalesceConstraint& constraint, int numWarps, int threadsPerWarp) {
+    auto refType = ptr.getType();
+    if (refType.isa<PointerType>())
+      refType = refType.cast<PointerType>().getPointeeType();
+    auto refTensorType = refType.cast<RankedTensorType>();
+
+    SmallVector<unsigned, 4> sizePerThread(refTensorType.getRank(), 1);
+    sizePerThread[constraint.order[0]] = constraint.sizePerThread;
 
     auto CTALayout = triton::gpu::getCTALayout(refTensorType.getEncoding());
     return triton::gpu::BlockedEncodingAttr::get(
-        &getContext(), refTensorType.getShape(), sizePerThread, order, numWarps,
+        &getContext(), refTensorType.getShape(), sizePerThread, constraint.order, numWarps,
         threadsPerWarp, CTALayout);
   }
 
   std::function<Type(Type)>
-  getTypeConverter(ModuleAxisInfoAnalysis &axisInfoAnalysis, Value ptr,
-                   int numWarps, int threadsPerWarp) {
-    Attribute encoding =
-        getCoalescedEncoding(axisInfoAnalysis, ptr, numWarps, threadsPerWarp);
-    return [encoding](Type type) {
-      RankedTensorType tensorType = type.cast<RankedTensorType>();
-      return RankedTensorType::get(tensorType.getShape(),
-                                   tensorType.getElementType(), encoding);
-    };
+  getTypeConverter(std::optional<CoalesceConstraint> encodingConstraint,
+                   Value ptr, int numWarps, int threadsPerWarp) {
+    if (encodingConstraint) {
+      Attribute encoding = getCoalescedEncoding(ptr, *encodingConstraint, numWarps, threadsPerWarp);
+      return [encoding](Type type) {
+        RankedTensorType tensorType = type.cast<RankedTensorType>();
+        return RankedTensorType::get(tensorType.getShape(),
+                                    tensorType.getElementType(), encoding);
+      };
+    } else {
+      return [](Type type) {
+        return type;
+      };
+    }
+  }
+
+  bool typeObeysConstraint(Value ptr, const CoalesceConstraint& constraint) {
+    auto tensorType = ptr.getType().dyn_cast<RankedTensorType>();
+    if (!tensorType) {
+      return false;
+    }
+    auto encoding = tensorType.getEncoding().dyn_cast<triton::gpu::BlockedEncodingAttr>();
+    if (!encoding) {
+      return false;
+    }
+    if (!(encoding.getOrder() == ArrayRef<unsigned>(constraint.order))) {
+      return false;
+    }
+    return encoding.getSizePerThread()[constraint.order[0]] >= constraint.sizePerThread;
   }
 
   template <class T>
   void coalesceOp(LayoutMap &layoutMap, Operation *op, Value ptr,
-                  OpBuilder builder) {
+                  OpBuilder builder, unsigned numWarps, unsigned threadsPerWarp) {
     if (!layoutMap.count(ptr))
       return;
 
@@ -152,7 +198,22 @@ struct CoalescePass : public TritonGPUCoalesceBase<CoalescePass> {
     // For load/store with tensor pointers, we don't have to change the
     // operands' type, we do this by changing the outputs' type of
     // `make_tensor_ptr`
-    auto convertType = layoutMap.lookup(ptr);
+    std::optional<CoalesceConstraint> encodingConstraint =
+        layoutMap.lookup(ptr);
+
+    // If this op doesn't have any constraints, don't attempt to enforce
+    // any particular layout
+    if (!encodingConstraint) {
+      return;
+    }
+
+    // If the type already obeys the constraints, do nothing.
+    if (typeObeysConstraint(ptr, *encodingConstraint)) {
+      return;
+    }
+
+    auto convertType =
+        getTypeConverter(encodingConstraint, ptr, numWarps, threadsPerWarp);
     SmallVector<Value, 4> newArgs;
     for (auto operand : op->getOperands()) {
       auto tensorType = operand.getType().dyn_cast<RankedTensorType>();
@@ -188,12 +249,12 @@ struct CoalescePass : public TritonGPUCoalesceBase<CoalescePass> {
   }
 
   void coalesceMakeTensorPtrOpResult(LayoutMap &layoutMap, Operation *op,
-                                     Value ptr, OpBuilder builder) {
+                                     Value ptr, OpBuilder builder, unsigned numWarps, unsigned threadsPerWarp) {
     if (!layoutMap.count(ptr))
       return;
 
     // Convert result type
-    auto convertType = layoutMap.lookup(ptr);
+    auto convertType = getTypeConverter(layoutMap.lookup(ptr), ptr, numWarps, threadsPerWarp);
     auto ptrType = ptr.getType().cast<PointerType>();
     auto resultTensorType = convertType(ptrType.getPointeeType());
     auto newResultType =
@@ -210,6 +271,10 @@ struct CoalescePass : public TritonGPUCoalesceBase<CoalescePass> {
     // Run axis info analysis
     ModuleOp moduleOp = getOperation();
     ModuleAxisInfoAnalysis axisInfoAnalysis(moduleOp);
+
+    int numWarps = triton::gpu::TritonGPUDialect::getNumWarps(moduleOp);
+    int threadsPerWarp =
+        triton::gpu::TritonGPUDialect::getThreadsPerWarp(moduleOp);
 
     // For each i/o operation, we determine what layout
     // the pointers should have for best memory coalescing
@@ -236,13 +301,10 @@ struct CoalescePass : public TritonGPUCoalesceBase<CoalescePass> {
         isTensorPointer = ptrType.getPointeeType().isa<RankedTensorType>();
       if (!isPtrTensor && !isTensorPointer)
         return;
-      auto mod = curr->getParentOfType<ModuleOp>();
-      int numWarps = triton::gpu::TritonGPUDialect::getNumWarps(mod);
-      int threadsPerWarp =
-          triton::gpu::TritonGPUDialect::getThreadsPerWarp(mod);
-      auto convertType =
-          getTypeConverter(axisInfoAnalysis, ptr, numWarps, threadsPerWarp);
-      layoutMap[ptr] = convertType;
+      std::optional<CoalesceConstraint> encodingConstraint =
+          getCoalescedConstraint(axisInfoAnalysis, ptr, numWarps, threadsPerWarp);
+      // layoutMap[ptr] = convertType;
+      layoutMap[ptr] = std::move(encodingConstraint);
     });
 
     // For each memory op that has a layout L1:
@@ -255,24 +317,24 @@ struct CoalescePass : public TritonGPUCoalesceBase<CoalescePass> {
     moduleOp.walk([&](Operation *curr) {
       OpBuilder builder(curr);
       if (auto load = dyn_cast<triton::LoadOp>(curr)) {
-        coalesceOp<triton::LoadOp>(layoutMap, curr, load.getPtr(), builder);
+        coalesceOp<triton::LoadOp>(layoutMap, curr, load.getPtr(), builder, numWarps, threadsPerWarp);
         return;
       }
       if (auto op = dyn_cast<triton::AtomicRMWOp>(curr)) {
-        coalesceOp<triton::AtomicRMWOp>(layoutMap, curr, op.getPtr(), builder);
+        coalesceOp<triton::AtomicRMWOp>(layoutMap, curr, op.getPtr(), builder, numWarps, threadsPerWarp);
         return;
       }
       if (auto op = dyn_cast<triton::AtomicCASOp>(curr)) {
-        coalesceOp<triton::AtomicCASOp>(layoutMap, curr, op.getPtr(), builder);
+        coalesceOp<triton::AtomicCASOp>(layoutMap, curr, op.getPtr(), builder, numWarps, threadsPerWarp);
         return;
       }
       if (auto load = dyn_cast<triton::gpu::InsertSliceAsyncOp>(curr)) {
         coalesceOp<triton::gpu::InsertSliceAsyncOp>(layoutMap, curr,
-                                                    load.getSrc(), builder);
+                                                    load.getSrc(), builder, numWarps, threadsPerWarp);
         return;
       }
       if (auto store = dyn_cast<triton::StoreOp>(curr)) {
-        coalesceOp<triton::StoreOp>(layoutMap, curr, store.getPtr(), builder);
+        coalesceOp<triton::StoreOp>(layoutMap, curr, store.getPtr(), builder, numWarps, threadsPerWarp);
         return;
       }
     });

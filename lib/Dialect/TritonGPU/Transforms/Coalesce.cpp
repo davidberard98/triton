@@ -35,15 +35,13 @@ struct CoalescedConstraint {
 
 typedef DenseMap<Value, std::optional<CoalescedConstraint>> LayoutMap;
 
-// TODO better name
+// TODO remove dump() and cerr/cout.
 // TODO: calculate this once instead of for each conversion...
-RankedTensorType maximizeContiguousShape(
-  RankedTensorType origType,
-  MLIRContext* context,
-  const CoalescedConstraint& constraint,
-  unsigned numWarps,
-  unsigned threadsPerWarp
-) {
+RankedTensorType maximizeContiguousShape(RankedTensorType origType,
+                                         MLIRContext *context,
+                                         const CoalescedConstraint &constraint,
+                                         unsigned numWarps,
+                                         unsigned threadsPerWarp) {
   ArrayRef<int64_t> shape = origType.getShape();
   int rank = shape.size();
 
@@ -54,56 +52,59 @@ RankedTensorType maximizeContiguousShape(
 
   auto CTALayout = triton::gpu::getCTALayout(origType.getEncoding());
   auto newEncoding = triton::gpu::BlockedEncodingAttr::get(
-    context, shape, sizePerThread, constraint.order, numWarps, threadsPerWarp, CTALayout);
-  auto newType = RankedTensorType::get(shape, origType.getElementType(), newEncoding);
+      context, shape, sizePerThread, constraint.order, numWarps, threadsPerWarp,
+      CTALayout);
+  auto newType =
+      RankedTensorType::get(shape, origType.getElementType(), newEncoding);
   return newType;
 }
 
-class MaximizeCoalesceSupportedState {
+class ReassignEncodingSupportedState {
 public:
   void addShape(ArrayRef<int64_t> shape) { shapes.insert(std::move(shape)); }
-  int uniqueShapes() const {
-    return shapes.size();
-  }
-  void markUnsupported() {
-    supported = false;
-  }
-  bool isSupported() const {
-    return supported;
-  }
+  int uniqueShapes() const { return shapes.size(); }
+  void markUnsupported() { supported = false; }
+  bool isSupported() const { return supported; }
+
 private:
-  // TODO this should be a SmallVector not an ArrayRef because
-  // ArrayRef doesn't own the storage
   SetVector<ArrayRef<int64_t>> shapes;
   bool supported{true};
 };
 
-class MaximizeCoalesceOpHandler {
+class ReassignEncodingOpHandler {
 public:
-  MaximizeCoalesceOpHandler() = default;
-  virtual ~MaximizeCoalesceOpHandler() = default;
-  virtual LogicalResult matchAndRewrite(Operation* op, PatternRewriter& rewriter, MLIRContext* context, const CoalescedConstraint& constraint, unsigned numWarps, unsigned threadsPerWarp) const = 0;
-  virtual bool matchOp(Operation* op) const = 0;
-  virtual bool supported(Operation* op, MaximizeCoalesceSupportedState& state) const = 0;
+  ReassignEncodingOpHandler() = default;
+  virtual ~ReassignEncodingOpHandler() = default;
+  virtual LogicalResult
+  matchAndRewrite(Operation *op, PatternRewriter &rewriter,
+                  MLIRContext *context, const CoalescedConstraint &constraint,
+                  unsigned numWarps, unsigned threadsPerWarp) const = 0;
+  virtual bool matchOp(Operation *op) const = 0;
+  virtual bool supported(Operation *op,
+                         ReassignEncodingSupportedState &state) const = 0;
 };
 
 template <typename OpTy>
-class MaximizeCoalesceOpHandlerImpl : public MaximizeCoalesceOpHandler {
+class ReassignEncodingOpHandlerImpl : public ReassignEncodingOpHandler {
 public:
-  MaximizeCoalesceOpHandlerImpl() = default;
-  virtual ~MaximizeCoalesceOpHandlerImpl() = default;
-
-  // TODO(dberard): split matchAndRewrite to match / rewrite.
-  //   Benefit: we can use it as part of the initial "can we rewrite?" check...
-  LogicalResult matchAndRewrite(Operation* op, PatternRewriter& rewriter, MLIRContext* context, const CoalescedConstraint& constraint, unsigned numWarps, unsigned threadsPerWarp) const override {
-    return matchAndRewriteImpl(cast<OpTy>(op), rewriter, context, constraint, numWarps, threadsPerWarp);
+  ReassignEncodingOpHandlerImpl() = default;
+  virtual ~ReassignEncodingOpHandlerImpl() = default;
+  LogicalResult matchAndRewrite(Operation *op, PatternRewriter &rewriter,
+                                MLIRContext *context,
+                                const CoalescedConstraint &constraint,
+                                unsigned numWarps,
+                                unsigned threadsPerWarp) const override {
+    return matchAndRewriteImpl(cast<OpTy>(op), rewriter, context, constraint,
+                               numWarps, threadsPerWarp);
   }
-  virtual LogicalResult matchAndRewriteImpl(OpTy op, PatternRewriter& rewriter, MLIRContext* context, const CoalescedConstraint& constraint, unsigned numWarps, unsigned threadsPerWarp) const = 0;
-  bool matchOp(Operation* op) const override final {
-    return isa<OpTy>(op);
-  }
-  bool supported(Operation* op, MaximizeCoalesceSupportedState& state) const override {
-    for (const Value& result : op->getResults()) {
+  virtual LogicalResult
+  matchAndRewriteImpl(OpTy op, PatternRewriter &rewriter, MLIRContext *context,
+                      const CoalescedConstraint &constraint, unsigned numWarps,
+                      unsigned threadsPerWarp) const = 0;
+  bool matchOp(Operation *op) const override final { return isa<OpTy>(op); }
+  bool supported(Operation *op,
+                 ReassignEncodingSupportedState &state) const override {
+    for (const Value &result : op->getResults()) {
       if (result.getType().template dyn_cast<PointerType>()) {
         return false; // block pointer not supported
       }
@@ -115,12 +116,16 @@ public:
         std::cerr << "   fails: not RankedTensorType" << std::endl;
         return false;
       }
-      auto encoding = type.getEncoding().template dyn_cast<triton::gpu::BlockedEncodingAttr>();
+      auto encoding =
+          type.getEncoding()
+              .template dyn_cast<triton::gpu::BlockedEncodingAttr>();
       if (!encoding) {
-        std::cerr << "   fails: not BlockedEncodingAttr" << std::endl;
+        std::cerr << "   fails: not BlockedEncodingAttr:"
+                  << op->getName().getStringRef().str() << std::endl;
         return false;
       }
-      // For simplicity, only support graphs where all tensors have the same shape
+      // For simplicity, only support graphs where all tensors have the same
+      // shape
       state.addShape(type.getShape());
     }
     return supportedImpl(cast<OpTy>(op));
@@ -128,14 +133,19 @@ public:
   virtual bool supportedImpl(OpTy op) const = 0;
 };
 
-class MaximizeCoalesceConstantOp : public MaximizeCoalesceOpHandlerImpl<arith::ConstantOp> {
-  LogicalResult matchAndRewriteImpl(arith::ConstantOp op, PatternRewriter& rewriter, MLIRContext* context, const CoalescedConstraint& constraint, unsigned numWarps, unsigned threadsPerWarp) const override final {
-    // TODO(dberard): unify origType / oldType naming scheme...
+class ReassignEncodingConstantOp
+    : public ReassignEncodingOpHandlerImpl<arith::ConstantOp> {
+  LogicalResult
+  matchAndRewriteImpl(arith::ConstantOp op, PatternRewriter &rewriter,
+                      MLIRContext *context,
+                      const CoalescedConstraint &constraint, unsigned numWarps,
+                      unsigned threadsPerWarp) const override final {
     auto origType = op.getResult().getType().dyn_cast<RankedTensorType>();
     if (!origType) {
       return failure();
     }
-    auto origEncoding = origType.getEncoding().dyn_cast<triton::gpu::BlockedEncodingAttr>();
+    auto origEncoding =
+        origType.getEncoding().dyn_cast<triton::gpu::BlockedEncodingAttr>();
     if (!origEncoding) {
       return failure();
     }
@@ -144,47 +154,54 @@ class MaximizeCoalesceConstantOp : public MaximizeCoalesceOpHandlerImpl<arith::C
       return failure();
     }
     RankedTensorType newType = maximizeContiguousShape(
-      origType, context, constraint, numWarps, threadsPerWarp
-    );
+        origType, context, constraint, numWarps, threadsPerWarp);
     if (newType == origType) {
       return failure();
     }
     auto getSizePerThread = [](RankedTensorType ty) -> unsigned {
-      return ty
-        .getEncoding()
-        .cast<triton::gpu::BlockedEncodingAttr>()
-        .getSizePerThread()[0];
+      return ty.getEncoding()
+          .cast<triton::gpu::BlockedEncodingAttr>()
+          .getSizePerThread()[0];
     };
-    std::cerr << " Replacing " << op << " , " << getSizePerThread(origType) << " with newop , " << getSizePerThread(newType) << std::endl;
-    std::cerr << "     value type " << getSizePerThread(value.getType().cast<RankedTensorType>()) << std::endl;
+    std::cerr << " Replacing " << op << " , " << getSizePerThread(origType)
+              << " with newop , " << getSizePerThread(newType) << std::endl;
+    std::cerr << "     value type "
+              << getSizePerThread(value.getType().cast<RankedTensorType>())
+              << std::endl;
     auto newShapedType = newType.cast<ShapedType>();
     value = value.reshape(newShapedType);
-    auto newOp = rewriter.replaceOpWithNewOp<arith::ConstantOp>(op, newShapedType, value);
+    auto newOp = rewriter.replaceOpWithNewOp<arith::ConstantOp>(
+        op, newShapedType, value);
     return success();
   }
 
-  bool supportedImpl(arith::ConstantOp op) const override final {
-    return true;
-  }
+  bool supportedImpl(arith::ConstantOp op) const override final { return true; }
 };
 
-class MaximizeCoalesceGeneric : public MaximizeCoalesceOpHandler {
-  LogicalResult matchAndRewrite(Operation* op, PatternRewriter& rewriter, MLIRContext* context, const CoalescedConstraint& constraint, unsigned numWarps, unsigned threadsPerWarp) const override final {
+class ReassignEncodingGeneric : public ReassignEncodingOpHandler {
+  LogicalResult matchAndRewrite(Operation *op, PatternRewriter &rewriter,
+                                MLIRContext *context,
+                                const CoalescedConstraint &constraint,
+                                unsigned numWarps,
+                                unsigned threadsPerWarp) const override final {
     if (op->getResults().size() == 0) {
       return failure();
     }
-    assert(op->getResults().size() == 1 && "Expected only 1 result from this op");
-    const auto& oldResult = op->getResults()[0];
+    assert(op->getResults().size() == 1 &&
+           "Expected only 1 result from this op");
+    const auto &oldResult = op->getResults()[0];
     auto rttType = oldResult.getType().dyn_cast<RankedTensorType>();
     if (!rttType) {
       return failure();
     }
-    auto encoding = rttType.getEncoding().dyn_cast<triton::gpu::BlockedEncodingAttr>();
+    auto encoding =
+        rttType.getEncoding().dyn_cast<triton::gpu::BlockedEncodingAttr>();
     if (!encoding) {
       return failure();
     }
 
-    auto newType = maximizeContiguousShape(rttType, context, constraint, numWarps, threadsPerWarp);
+    auto newType = maximizeContiguousShape(rttType, context, constraint,
+                                           numWarps, threadsPerWarp);
 
     SmallVector<Type, 1> newReturnTypes;
     newReturnTypes.push_back(std::move(newType));
@@ -199,133 +216,140 @@ class MaximizeCoalesceGeneric : public MaximizeCoalesceOpHandler {
       return failure();
     }
 
-    Operation* newOp = rewriter.create(newState);
-    auto getSizePerThread = [](Operation* oper) -> unsigned {
-      return oper
-        ->getResults()[0]
-        .getType()
-        .cast<RankedTensorType>()
-        .getEncoding()
-        .cast<triton::gpu::BlockedEncodingAttr>()
-        .getSizePerThread()[0];
+    Operation *newOp = rewriter.create(newState);
+    auto getSizePerThread = [](Operation *oper) -> unsigned {
+      return oper->getResults()[0]
+          .getType()
+          .cast<RankedTensorType>()
+          .getEncoding()
+          .cast<triton::gpu::BlockedEncodingAttr>()
+          .getSizePerThread()[0];
     };
-    std::cerr << " Replacing " << op << " , " << getSizePerThread(op) << " with " << newOp << " , " << getSizePerThread(newOp) << std::endl;
+    std::cerr << " Replacing " << op << " , " << getSizePerThread(op)
+              << " with " << newOp << " , " << getSizePerThread(newOp)
+              << std::endl;
     rewriter.replaceOp(op, newOp->getResults());
 
     return success();
   }
-  bool matchOp(Operation* op) const override {
-    llvm_unreachable("matchOp not supported on MaximizeCoalesceGeneric");
+  bool matchOp(Operation *op) const override {
+    llvm_unreachable("matchOp not supported on ReassignEncodingGeneric");
   }
-  bool supported(Operation* op, MaximizeCoalesceSupportedState& state) const override final {
+  bool supported(Operation *op,
+                 ReassignEncodingSupportedState &state) const override final {
     return (op->getResults().size() <= 1);
   }
 };
 
-template<typename OpTy>
-class MaximizeCoalesceSupported : public MaximizeCoalesceGeneric {
-  bool matchOp(Operation* op) const override final {
-    return isa<OpTy>(op);
-  }
+template <typename OpTy>
+class ReassignEncodingSupported : public ReassignEncodingGeneric {
+  bool matchOp(Operation *op) const override final { return isa<OpTy>(op); }
 };
 
-class MaximizeCoalesceArithOps : public MaximizeCoalesceGeneric {
-  bool matchOp(Operation* op) const override final {
+class ReassignEncodingArithOps : public ReassignEncodingGeneric {
+  bool matchOp(Operation *op) const override final {
     // ConstantOp needs special handling for its value.
-    return op->getName().getDialect()->getNamespace() == "arith" && !isa<arith::ConstantOp>(op);
+    return op->getName().getDialect()->getNamespace() == "arith" &&
+           !isa<arith::ConstantOp>(op);
   }
 };
 
-class MaximizeCoalesceMathOps : public MaximizeCoalesceGeneric {
-  bool matchOp(Operation* op) const override final {
+class ReassignEncodingMathOps : public ReassignEncodingGeneric {
+  bool matchOp(Operation *op) const override final {
     // ConstantOp needs special handling for its value.
-    return op->getName().getDialect()->getNamespace() == "math" && op->hasTrait<OpTrait::SameOperandsAndResultType>();
+    return op->getName().getDialect()->getNamespace() == "math" &&
+           op->hasTrait<OpTrait::SameOperandsAndResultType>();
   }
 };
 
-class MaximizeCoalesceSameOpResultEncoding : public MaximizeCoalesceGeneric {
-  bool matchOp(Operation* op) const override final {
-    return op->hasTrait<OpTrait::SameOperandsAndResultEncoding>()
-        && op->hasTrait<OpTrait::SameOperandsAndResultShape>();
+class ReassignEncodingSameOpResultEncoding : public ReassignEncodingGeneric {
+  bool matchOp(Operation *op) const override final {
+    return op->hasTrait<OpTrait::SameOperandsAndResultEncoding>() &&
+           op->hasTrait<OpTrait::SameOperandsAndResultShape>();
   }
 };
 
-template<typename OpTy>
-class MaximizeCoalesceUnsupported : public MaximizeCoalesceOpHandlerImpl<OpTy> {
-  LogicalResult matchAndRewriteImpl(OpTy, PatternRewriter&, MLIRContext*, const CoalescedConstraint&, unsigned, unsigned) const override final {
+template <typename OpTy>
+class ReassignEncodingUnsupported : public ReassignEncodingOpHandlerImpl<OpTy> {
+  LogicalResult matchAndRewriteImpl(OpTy, PatternRewriter &, MLIRContext *,
+                                    const CoalescedConstraint &, unsigned,
+                                    unsigned) const override final {
     return failure();
   }
 
-  bool supportedImpl(OpTy op) const override final {
-    return false;
-  }
+  bool supportedImpl(OpTy op) const override final { return false; }
 };
 
-// TODO: currently not used. Maybe remove it.
-template<typename OpTy>
-class MaximizeCoalesceNoOp : public MaximizeCoalesceOpHandler {
-  LogicalResult matchAndRewrite(Operation*, PatternRewriter&, MLIRContext*, const CoalescedConstraint&, unsigned, unsigned) const override final {
-    return failure();
-  }
-  bool matchOp(Operation* op) const override final {
-    return isa<OpTy>(op);
-  }
-  bool supported(Operation*, MaximizeCoalesceSupportedState&) const override final {
-    return true;
-  }
-};
-
-class MaximizeCoalesceOpHandlerList {
+class ReassignEncodingOpHandlerList {
 public:
-  template<typename T>
-  void append() {
+  template <typename T> void append() {
     // TODO rename
     visitors.push_back(std::make_unique<T>());
   }
 
-  bool supported(Operation* op, MaximizeCoalesceSupportedState& state) const {
-    for (const auto& visitor : visitors) {
+  bool supported(Operation *op, ReassignEncodingSupportedState &state) const {
+    for (const auto &visitor : visitors) {
       if (visitor->matchOp(op)) {
         return visitor->supported(op, state);
       }
     }
     // TODO make it default to just "false"
-    // llvm_unreachable(("No handler for " + op->getName().getStringRef()).str().c_str());
-    std::cerr << " ! Unsupported op " << op->getName().getStringRef().str() << std::endl;
+    // llvm_unreachable(("No handler for " +
+    // op->getName().getStringRef()).str().c_str());
+    std::cerr << " ! Unsupported op " << op->getName().getStringRef().str()
+              << std::endl;
     return false;
   }
 
-  LogicalResult matchAndRewrite(Operation* op, PatternRewriter& rewriter, MLIRContext* context, const CoalescedConstraint& constraint, unsigned numWarps, unsigned threadsPerWarp) const {
-    for (const auto& visitor : visitors) {
+  LogicalResult matchAndRewrite(Operation *op, PatternRewriter &rewriter,
+                                MLIRContext *context,
+                                const CoalescedConstraint &constraint,
+                                unsigned numWarps,
+                                unsigned threadsPerWarp) const {
+    for (const auto &visitor : visitors) {
       if (visitor->matchOp(op)) {
-        return visitor->matchAndRewrite(op, rewriter, context, constraint, numWarps, threadsPerWarp);
+        return visitor->matchAndRewrite(op, rewriter, context, constraint,
+                                        numWarps, threadsPerWarp);
       }
     }
-    llvm_unreachable(("No matchAndRewrite handler for " + op->getName().getStringRef()).str().c_str());
+    llvm_unreachable(
+        ("No matchAndRewrite handler for " + op->getName().getStringRef())
+            .str()
+            .c_str());
   }
+
 private:
-  std::vector<std::unique_ptr<MaximizeCoalesceOpHandler>> visitors;
+  std::vector<std::unique_ptr<ReassignEncodingOpHandler>> visitors;
 };
 
-class MaximizeCoalescePattern : public RewritePattern {
+class ReassignEncodingPattern : public RewritePattern {
 public:
-  explicit MaximizeCoalescePattern(MLIRContext* context, MaximizeCoalesceOpHandlerList handlers, const CoalescedConstraint& constraint, unsigned numWarps, unsigned threadsPerWarp) : RewritePattern(MatchAnyOpTypeTag(), /*benefit=*/1, context), handlers(std::move(handlers)), constraint(std::move(constraint)), numWarps(numWarps), threadsPerWarp(threadsPerWarp) {
+  explicit ReassignEncodingPattern(MLIRContext *context,
+                                   ReassignEncodingOpHandlerList handlers,
+                                   const CoalescedConstraint &constraint,
+                                   unsigned numWarps, unsigned threadsPerWarp)
+      : RewritePattern(MatchAnyOpTypeTag(), /*benefit=*/1, context),
+        handlers(std::move(handlers)), constraint(std::move(constraint)),
+        numWarps(numWarps), threadsPerWarp(threadsPerWarp) {}
+
+  LogicalResult matchAndRewrite(Operation *op,
+                                PatternRewriter &rewriter) const override {
+    std::cerr << "Handling " << op << std::endl;
+    return handlers.matchAndRewrite(op, rewriter, getContext(), constraint,
+                                    numWarps, threadsPerWarp);
   }
 
-  LogicalResult matchAndRewrite(Operation* op, PatternRewriter& rewriter) const override {
-    std::cerr << "Handling " << op << std::endl;
-    return handlers.matchAndRewrite(op, rewriter, getContext(), constraint, numWarps, threadsPerWarp);
-  }
 private:
   unsigned numWarps;
   unsigned threadsPerWarp;
-  MaximizeCoalesceOpHandlerList handlers; // TODO rename
+  ReassignEncodingOpHandlerList handlers; // TODO rename
   CoalescedConstraint constraint;
 };
 
 struct CoalescePass : public TritonGPUCoalesceBase<CoalescePass> {
-  std::optional<CoalescedConstraint> getCoalescedConstraint(ModuleAxisInfoAnalysis &axisInfoAnalysis,
-                                 Value ptr, int numWarps, int threadsPerWarp) {
+  std::optional<CoalescedConstraint>
+  getCoalescedConstraint(ModuleAxisInfoAnalysis &axisInfoAnalysis, Value ptr,
+                         int numWarps, int threadsPerWarp) {
     auto refType = ptr.getType();
     if (refType.isa<PointerType>())
       refType = refType.cast<PointerType>().getPointeeType();
@@ -374,8 +398,9 @@ struct CoalescePass : public TritonGPUCoalesceBase<CoalescePass> {
 
       // If there are no known contiguity properties, this value shouldn't
       // require any ordering, to avoid forcing any ordering.
-      const auto& contiguity = queryAxisInfo(ptr).getContiguity();
-      if (!std::any_of(contiguity.begin(), contiguity.end(), [](int64_t x) {return x>1;})) {
+      const auto &contiguity = queryAxisInfo(ptr).getContiguity();
+      if (!std::any_of(contiguity.begin(), contiguity.end(),
+                       [](int64_t x) { return x > 1; })) {
         return std::nullopt;
       }
       order = argSort(contiguity);
@@ -433,7 +458,8 @@ struct CoalescePass : public TritonGPUCoalesceBase<CoalescePass> {
     return CoalescedConstraint{order, constraint};
   }
 
-  Attribute getCoalescedEncoding(const CoalescedConstraint& constraint, Value ptr, int numWarps, int threadsPerWarp) {
+  Attribute getCoalescedEncoding(const CoalescedConstraint &constraint,
+                                 Value ptr, int numWarps, int threadsPerWarp) {
     auto refType = ptr.getType();
     if (refType.isa<PointerType>())
       refType = refType.cast<PointerType>().getPointeeType();
@@ -444,40 +470,41 @@ struct CoalescePass : public TritonGPUCoalesceBase<CoalescePass> {
 
     auto CTALayout = triton::gpu::getCTALayout(refTensorType.getEncoding());
     return triton::gpu::BlockedEncodingAttr::get(
-        &getContext(), refTensorType.getShape(), sizePerThread, constraint.order, numWarps,
-        threadsPerWarp, CTALayout);
+        &getContext(), refTensorType.getShape(), sizePerThread,
+        constraint.order, numWarps, threadsPerWarp, CTALayout);
   }
 
   std::function<Type(Type)>
   getTypeConverter(std::optional<CoalescedConstraint> encodingConstraint,
                    Value ptr, int numWarps, int threadsPerWarp) {
     if (encodingConstraint) {
-      Attribute encoding = getCoalescedEncoding(*encodingConstraint, ptr, numWarps, threadsPerWarp);
+      Attribute encoding = getCoalescedEncoding(*encodingConstraint, ptr,
+                                                numWarps, threadsPerWarp);
       return [encoding](Type type) {
         RankedTensorType tensorType = type.cast<RankedTensorType>();
         return RankedTensorType::get(tensorType.getShape(),
-                                    tensorType.getElementType(), encoding);
+                                     tensorType.getElementType(), encoding);
       };
     } else {
-      return [](Type type) {
-        return type;
-      };
+      return [](Type type) { return type; };
     }
   }
 
-  bool typeObeysConstraint(Value ptr, const CoalescedConstraint& constraint) {
+  bool typeObeysConstraint(Value ptr, const CoalescedConstraint &constraint) {
     auto tensorType = ptr.getType().dyn_cast<RankedTensorType>();
     if (!tensorType) {
       return false;
     }
-    auto encoding = tensorType.getEncoding().dyn_cast<triton::gpu::BlockedEncodingAttr>();
+    auto encoding =
+        tensorType.getEncoding().dyn_cast<triton::gpu::BlockedEncodingAttr>();
     if (!encoding) {
       return false;
     }
     if (!(encoding.getOrder() == ArrayRef<unsigned>(constraint.order))) {
       return false;
     }
-    return encoding.getSizePerThread()[constraint.order[0]] >= constraint.sizePerThread;
+    return encoding.getSizePerThread()[constraint.order[0]] >=
+           constraint.sizePerThread;
   }
 
   template <class T>
@@ -504,7 +531,8 @@ struct CoalescePass : public TritonGPUCoalesceBase<CoalescePass> {
       return;
     }
 
-    auto convertType = getTypeConverter(encodingConstraint, ptr, numWarps, threadsPerWarp);
+    auto convertType =
+        getTypeConverter(encodingConstraint, ptr, numWarps, threadsPerWarp);
     SmallVector<Value, 4> newArgs;
 
     // Convert output types
@@ -520,8 +548,7 @@ struct CoalescePass : public TritonGPUCoalesceBase<CoalescePass> {
           !tensorType.getEncoding().isa<triton::gpu::SharedEncodingAttr>()) {
         newArgs.push_back(builder.create<triton::gpu::ConvertLayoutOp>(
             op->getLoc(), convertType(tensorType), operand));
-      }
-      else
+      } else
         newArgs.push_back(operand);
     }
 
@@ -542,12 +569,14 @@ struct CoalescePass : public TritonGPUCoalesceBase<CoalescePass> {
   }
 
   void coalesceMakeTensorPtrOpResult(LayoutMap &layoutMap, Operation *op,
-                                     Value ptr, OpBuilder builder, int numWarps, int threadsPerWarp) {
+                                     Value ptr, OpBuilder builder, int numWarps,
+                                     int threadsPerWarp) {
     if (!layoutMap.count(ptr))
       return;
 
     // Convert result type
-    auto convertType = getTypeConverter(layoutMap.lookup(ptr), ptr, numWarps, threadsPerWarp);
+    auto convertType =
+        getTypeConverter(layoutMap.lookup(ptr), ptr, numWarps, threadsPerWarp);
     auto ptrType = ptr.getType().cast<PointerType>();
     auto resultTensorType = convertType(ptrType.getPointeeType());
     auto newResultType =
@@ -560,8 +589,9 @@ struct CoalescePass : public TritonGPUCoalesceBase<CoalescePass> {
     op->erase();
   }
 
-  // TODO docstring. Something about sizePerThread and coalescing and limiting layout conversions
-  void tryResetDefaultEncoding(ModuleOp& moduleOp, const LayoutMap& layoutMap) {
+  // TODO docstring. Something about sizePerThread and coalescing and limiting
+  // layout conversions
+  void tryResetDefaultEncoding(ModuleOp &moduleOp, const LayoutMap &layoutMap) {
     int numWarps = triton::gpu::TritonGPUDialect::getNumWarps(moduleOp);
     int threadsPerWarp =
         triton::gpu::TritonGPUDialect::getThreadsPerWarp(moduleOp);
@@ -573,14 +603,15 @@ struct CoalescePass : public TritonGPUCoalesceBase<CoalescePass> {
     // to assign layouts in a way to minimize layout conversions. For now, only
     // reset the default encoding if there's 1 unique order.
     std::optional<CoalescedConstraint> bestConstraint = std::nullopt;
-    for (const auto& [_, constraint] : layoutMap) {
+    for (const auto &[_, constraint] : layoutMap) {
       if (!bestConstraint) {
         bestConstraint = constraint;
       } else if (constraint) {
         if (constraint->order != bestConstraint->order) {
           return;
         }
-        bestConstraint->sizePerThread = std::max(constraint->sizePerThread, bestConstraint->sizePerThread);
+        bestConstraint->sizePerThread =
+            std::max(constraint->sizePerThread, bestConstraint->sizePerThread);
       }
     }
 
@@ -588,51 +619,49 @@ struct CoalescePass : public TritonGPUCoalesceBase<CoalescePass> {
     if (!bestConstraint) {
       return;
     }
+    moduleOp.dump();
 
-    MaximizeCoalesceOpHandlerList handlers;
-    handlers.append<MaximizeCoalesceConstantOp>();
+    ReassignEncodingOpHandlerList handlers;
+    handlers.append<ReassignEncodingConstantOp>();
     // TODO: clean this up, e.g. maybe just pass lambdas...
     //       also some of the triton ops are duplicates.
-    handlers.append<MaximizeCoalesceArithOps>();
-    handlers.append<MaximizeCoalesceMathOps>();
-    handlers.append<MaximizeCoalesceSameOpResultEncoding>();
-    handlers.append<MaximizeCoalesceSupported<::mlir::gpu::BarrierOp>>();
-    handlers.append<MaximizeCoalesceSupported<scf::ConditionOp>>();
-    handlers.append<MaximizeCoalesceSupported<scf::ForOp>>();
-    handlers.append<MaximizeCoalesceSupported<scf::IfOp>>();
-    handlers.append<MaximizeCoalesceSupported<scf::WhileOp>>();
-    handlers.append<MaximizeCoalesceSupported<scf::YieldOp>>();
-    handlers.append<MaximizeCoalesceSupported<triton::AddPtrOp>>();
-    handlers.append<MaximizeCoalesceSupported<triton::AssertOp>>();
-    handlers.append<MaximizeCoalesceSupported<triton::AtomicRMWOp>>();
-    handlers.append<MaximizeCoalesceSupported<triton::BitcastOp>>();
-    handlers.append<MaximizeCoalesceSupported<triton::ExternElementwiseOp>>();
-    handlers.append<MaximizeCoalesceSupported<triton::FuncOp>>();
-    handlers.append<MaximizeCoalesceSupported<triton::GetProgramIdOp>>();
-    handlers.append<MaximizeCoalesceSupported<triton::LoadOp>>();
-    handlers.append<MaximizeCoalesceSupported<triton::MakeRangeOp>>();
-    handlers.append<MaximizeCoalesceSupported<triton::ReturnOp>>();
-    handlers.append<MaximizeCoalesceSupported<triton::SplatOp>>();
-    handlers.append<MaximizeCoalesceSupported<triton::StoreOp>>();
-    handlers.append<MaximizeCoalesceSupported<triton::gpu::CmpFOp>>();
-    handlers.append<MaximizeCoalesceSupported<triton::gpu::CmpIOp>>();
-    handlers.append<MaximizeCoalesceSupported<triton::gpu::SelectOp>>();
-    handlers.append<MaximizeCoalesceSupported<ModuleOp>>();
+    handlers.append<ReassignEncodingArithOps>();
+    handlers.append<ReassignEncodingMathOps>();
+    handlers.append<ReassignEncodingSameOpResultEncoding>();
+    handlers.append<ReassignEncodingSupported<::mlir::gpu::BarrierOp>>();
+    handlers.append<ReassignEncodingSupported<scf::ConditionOp>>();
+    handlers.append<ReassignEncodingSupported<scf::ForOp>>();
+    handlers.append<ReassignEncodingSupported<scf::IfOp>>();
+    handlers.append<ReassignEncodingSupported<scf::WhileOp>>();
+    handlers.append<ReassignEncodingSupported<scf::YieldOp>>();
+    handlers.append<ReassignEncodingSupported<triton::AddPtrOp>>();
+    handlers.append<ReassignEncodingSupported<triton::AssertOp>>();
+    handlers.append<ReassignEncodingSupported<triton::AtomicRMWOp>>();
+    handlers.append<ReassignEncodingSupported<triton::BitcastOp>>();
+    handlers.append<ReassignEncodingSupported<triton::ExternElementwiseOp>>();
+    handlers.append<ReassignEncodingSupported<triton::FuncOp>>();
+    handlers.append<ReassignEncodingSupported<triton::GetProgramIdOp>>();
+    handlers.append<ReassignEncodingSupported<triton::LoadOp>>();
+    handlers.append<ReassignEncodingSupported<triton::MakeRangeOp>>();
+    handlers.append<ReassignEncodingSupported<triton::ReturnOp>>();
+    handlers.append<ReassignEncodingSupported<triton::SplatOp>>();
+    handlers.append<ReassignEncodingSupported<triton::StoreOp>>();
+    handlers.append<ReassignEncodingSupported<triton::gpu::CmpFOp>>();
+    handlers.append<ReassignEncodingSupported<triton::gpu::CmpIOp>>();
+    handlers.append<ReassignEncodingSupported<triton::gpu::SelectOp>>();
+    handlers.append<ReassignEncodingSupported<ModuleOp>>();
 
-    // handlers.append<MaximizeCoalesceNoOp<triton::FuncOp>>();
-    // handlers.append<MaximizeCoalesceNoOp<ModuleOp>>();
+    handlers.append<ReassignEncodingUnsupported<triton::BroadcastOp>>();
+    handlers.append<ReassignEncodingUnsupported<triton::ExpandDimsOp>>();
+    handlers.append<ReassignEncodingUnsupported<triton::ReduceOp>>();
+    handlers.append<ReassignEncodingUnsupported<triton::ReduceReturnOp>>();
+    handlers
+        .append<ReassignEncodingUnsupported<triton::gpu::ConvertLayoutOp>>();
 
-    handlers.append<MaximizeCoalesceUnsupported<triton::BroadcastOp>>();
-    handlers.append<MaximizeCoalesceUnsupported<triton::ExpandDimsOp>>();
-    handlers.append<MaximizeCoalesceUnsupported<triton::ReduceOp>>();
-    handlers.append<MaximizeCoalesceUnsupported<triton::ReduceReturnOp>>();
-    handlers.append<MaximizeCoalesceUnsupported<triton::gpu::ConvertLayoutOp>>();
+    ReassignEncodingSupportedState state;
 
-    MaximizeCoalesceSupportedState state;
-
-    moduleOp.walk([&](Operation* curr) {
+    moduleOp.walk([&](Operation *curr) {
       if (!handlers.supported(curr, state)) {
-        // std::cerr << " Unsupported op instance: " << curr->getName().getStringRef().str() << std::endl;
         state.markUnsupported();
       }
     });
@@ -647,7 +676,9 @@ struct CoalescePass : public TritonGPUCoalesceBase<CoalescePass> {
 
     MLIRContext *context = &getContext();
     RewritePatternSet patterns(context);
-    patterns.add<MaximizeCoalescePattern>(context, std::move(handlers), *bestConstraint, numWarps, threadsPerWarp);
+    patterns.add<ReassignEncodingPattern>(context, std::move(handlers),
+                                          *bestConstraint, numWarps,
+                                          threadsPerWarp);
 
     if (applyPatternsAndFoldGreedily(moduleOp, std::move(patterns)).failed()) {
       std::cerr << " applyPatternsAndFoldGreedily failed" << std::endl;
@@ -661,7 +692,9 @@ struct CoalescePass : public TritonGPUCoalesceBase<CoalescePass> {
   void runOnOperation() override {
     // Run axis info analysis
     ModuleOp moduleOp = getOperation();
-    std::cerr << " runOnOperation: Coalesce, want to apply MaximizeCoalescePattern" << std::endl;
+    std::cerr
+        << " runOnOperation: Coalesce, want to apply ReassignEncodingPattern"
+        << std::endl;
 
     ModuleAxisInfoAnalysis axisInfoAnalysis(moduleOp);
 
@@ -694,7 +727,8 @@ struct CoalescePass : public TritonGPUCoalesceBase<CoalescePass> {
         isTensorPointer = ptrType.getPointeeType().isa<RankedTensorType>();
       if (!isPtrTensor && !isTensorPointer)
         return;
-      layoutMap[ptr] = getCoalescedConstraint(axisInfoAnalysis, ptr, numWarps, threadsPerWarp);
+      layoutMap[ptr] = getCoalescedConstraint(axisInfoAnalysis, ptr, numWarps,
+                                              threadsPerWarp);
     });
 
     tryResetDefaultEncoding(moduleOp, layoutMap);
@@ -709,24 +743,28 @@ struct CoalescePass : public TritonGPUCoalesceBase<CoalescePass> {
     moduleOp.walk([&](Operation *curr) {
       OpBuilder builder(curr);
       if (auto load = dyn_cast<triton::LoadOp>(curr)) {
-        coalesceOp<triton::LoadOp>(layoutMap, curr, load.getPtr(), builder, numWarps, threadsPerWarp);
+        coalesceOp<triton::LoadOp>(layoutMap, curr, load.getPtr(), builder,
+                                   numWarps, threadsPerWarp);
         return;
       }
       if (auto op = dyn_cast<triton::AtomicRMWOp>(curr)) {
-        coalesceOp<triton::AtomicRMWOp>(layoutMap, curr, op.getPtr(), builder, numWarps, threadsPerWarp);
+        coalesceOp<triton::AtomicRMWOp>(layoutMap, curr, op.getPtr(), builder,
+                                        numWarps, threadsPerWarp);
         return;
       }
       if (auto op = dyn_cast<triton::AtomicCASOp>(curr)) {
-        coalesceOp<triton::AtomicCASOp>(layoutMap, curr, op.getPtr(), builder, numWarps, threadsPerWarp);
+        coalesceOp<triton::AtomicCASOp>(layoutMap, curr, op.getPtr(), builder,
+                                        numWarps, threadsPerWarp);
         return;
       }
       if (auto load = dyn_cast<triton::gpu::InsertSliceAsyncOp>(curr)) {
-        coalesceOp<triton::gpu::InsertSliceAsyncOp>(layoutMap, curr,
-                                                    load.getSrc(), builder, numWarps, threadsPerWarp);
+        coalesceOp<triton::gpu::InsertSliceAsyncOp>(
+            layoutMap, curr, load.getSrc(), builder, numWarps, threadsPerWarp);
         return;
       }
       if (auto store = dyn_cast<triton::StoreOp>(curr)) {
-        coalesceOp<triton::StoreOp>(layoutMap, curr, store.getPtr(), builder, numWarps, threadsPerWarp);
+        coalesceOp<triton::StoreOp>(layoutMap, curr, store.getPtr(), builder,
+                                    numWarps, threadsPerWarp);
         return;
       }
     });

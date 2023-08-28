@@ -19,6 +19,19 @@ template <class T> SmallVector<unsigned, 4> argSort(const T &arr) {
   return ret;
 }
 
+unsigned getElementBitWidth(const Value &val) {
+  auto valType = val.getType();
+  if (valType.isa<PointerType>())
+    valType = valType.cast<PointerType>().getPointeeType();
+  auto tensorType = valType.cast<RankedTensorType>();
+
+  auto typeForMem =
+      tensorType.getElementType().isa<PointerType>()
+          ? tensorType.getElementType().cast<PointerType>().getPointeeType()
+          : tensorType.getElementType();
+  return typeForMem.getIntOrFloatBitWidth();
+}
+
 typedef DenseMap<Value, std::function<Type(Type)>> LayoutMap;
 
 struct CoalescePass : public TritonGPUCoalesceBase<CoalescePass> {
@@ -29,6 +42,19 @@ struct CoalescePass : public TritonGPUCoalesceBase<CoalescePass> {
     size_t rank = origType.getRank();
     // Get the contiguity order of `ptr`
     auto order = argSort(axisInfoAnalysis.getAxisInfo(ptr)->getContiguity());
+
+    auto matchesOrder = [&refTensorType](const Value &val) {
+      if (val.getType() == refTensorType) {
+        return true;
+      }
+
+      auto rttType = val.getType().dyn_cast<RankedTensorType>();
+      if (!rttType) {
+        return false;
+      }
+      return rttType.getShape() == refTensorType.getShape();
+    };
+
     // The desired divisibility is the maximum divisibility
     // among all dependent pointers who have the same order as
     // `ptr`
@@ -37,7 +63,7 @@ struct CoalescePass : public TritonGPUCoalesceBase<CoalescePass> {
     if (ptr.getDefiningOp())
       for (Operation *op : mlir::multiRootGetSlice(ptr.getDefiningOp())) {
         for (Value val : op->getResults()) {
-          if (val.getType() != origType)
+          if (!matchesOrder(val))
             continue;
           auto currOrder =
               argSort(axisInfoAnalysis.getAxisInfo(val)->getContiguity());
@@ -49,13 +75,13 @@ struct CoalescePass : public TritonGPUCoalesceBase<CoalescePass> {
     int numThreads = numWarps * threadsPerWarp;
     int numElemsPerThread = std::max(numElems / numThreads, 1);
     // Thread tile size depends on memory alignment
-    SmallVector<unsigned, 4> sizePerThread(rank, 1);
-    unsigned elemNumBits = triton::getPointeeBitWidth(origType);
-    unsigned elemNumBytes = std::max(elemNumBits / 8, 1u);
+    SmallVector<unsigned, 4> sizePerThread(refTensorType.getRank(), 1);
     unsigned perThread = 1;
     for (Value val : withSameOrder) {
-      unsigned maxMultipleBytes =
-          axisInfoAnalysis.getAxisInfo(val)->getDivisibility(order[0]);
+      auto valInfo = queryAxisInfo(val);
+      unsigned elemNumBits = getElementBitWidth(val);
+      unsigned elemNumBytes = std::max(elemNumBits / 8, 1u);
+      unsigned maxMultipleBytes = valInfo.getDivisibility(order[0]);
       unsigned maxMultiple = std::max(maxMultipleBytes / elemNumBytes, 1u);
       unsigned maxContig =
           axisInfoAnalysis.getAxisInfo(val)->getContiguity(order[0]);

@@ -44,8 +44,8 @@ struct CoalescePass : public TritonGPUCoalesceBase<CoalescePass> {
     // Get the contiguity order of `ptr`
     auto order = argSort(axisInfoAnalysis.getAxisInfo(ptr)->getContiguity());
 
-    auto matchesOrder = [&refTensorType](const Value &val) {
-      if (val.getType() == refTensorType) {
+    auto matchesOrder = [&origType](const Value &val) {
+      if (val.getType() == origType) {
         return true;
       }
 
@@ -53,7 +53,7 @@ struct CoalescePass : public TritonGPUCoalesceBase<CoalescePass> {
       if (!rttType) {
         return false;
       }
-      return rttType.getShape() == refTensorType.getShape();
+      return rttType.getShape() == origType.getShape();
     };
 
     // The desired divisibility is the maximum divisibility
@@ -76,13 +76,13 @@ struct CoalescePass : public TritonGPUCoalesceBase<CoalescePass> {
     int numThreads = numWarps * threadsPerWarp;
     int numElemsPerThread = std::max(numElems / numThreads, 1);
     // Thread tile size depends on memory alignment
-    SmallVector<unsigned, 4> sizePerThread(refTensorType.getRank(), 1);
+    SmallVector<unsigned, 4> sizePerThread(origType.getRank(), 1);
     unsigned perThread = 1;
     for (Value val : withSameOrder) {
-      auto valInfo = queryAxisInfo(val);
+      auto valInfo = axisInfoAnalysis.getAxisInfo(val);
       unsigned elemNumBits = getElementBitWidth(val);
       unsigned elemNumBytes = std::max(elemNumBits / 8, 1u);
-      unsigned maxMultipleBytes = valInfo.getDivisibility(order[0]);
+      unsigned maxMultipleBytes = valInfo->getDivisibility(order[0]);
       unsigned maxMultiple = std::max(maxMultipleBytes / elemNumBytes, 1u);
       unsigned maxContig =
           axisInfoAnalysis.getAxisInfo(val)->getContiguity(order[0]);
@@ -117,7 +117,7 @@ struct CoalescePass : public TritonGPUCoalesceBase<CoalescePass> {
   getTypeConverter(ModuleAxisInfoAnalysis &axisInfoAnalysis, Value ptr,
                    Operation *op, int numWarps, int threadsPerWarp) {\
     Attribute encoding =
-        getCoalescedEncoding(axisInfoAnalysis, ptr, numWarps, threadsPerWarp);
+        getCoalescedEncoding(axisInfoAnalysis, ptr, op, numWarps, threadsPerWarp);
     return [encoding](Type _type) {
       RankedTensorType type = _type.cast<RankedTensorType>();
       return RankedTensorType::get(type.getShape(), type.getElementType(),

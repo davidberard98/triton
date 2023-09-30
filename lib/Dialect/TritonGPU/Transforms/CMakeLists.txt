@@ -8,6 +8,7 @@ add_mlir_dialect_library(TritonGPUTransforms
   Prefetch.cpp
   RemoveLayoutConversions.cpp
   ReorderInstructions.cpp
+  SimplifyConstantLoads.cpp
   TritonGPUConversion.cpp
   Utility.cpp
 

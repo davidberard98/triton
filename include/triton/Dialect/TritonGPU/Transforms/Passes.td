@@ -98,6 +98,19 @@ def TritonGPUCoalesce: Pass<"tritongpu-coalesce", "mlir::ModuleOp"> {
 }
 
 
+def TritonGPUSimplifyConstantLoads: Pass<"tritongpu-simplify-constant-loads", "mlir::ModuleOp"> {
+  let summary = "simplify constant loads";
+
+  let description = [{
+    If a thread will be performing duplicated loads, deduplicate the loads.
+  }];
+
+  let constructor = "mlir::createTritonGPUSimplifyConstantLoadsPass()";
+
+  let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect"];
+}
+
+
 def TritonGPURemoveLayoutConversions : Pass<"tritongpu-remove-layout-conversions", "mlir::ModuleOp"> {
   let summary = "remove superfluous layout conversions";
 

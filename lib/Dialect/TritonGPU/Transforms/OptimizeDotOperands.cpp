@@ -8,6 +8,7 @@
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include <memory>
+#include <stack>
 
 namespace mlir {
 namespace triton {
@@ -300,6 +301,125 @@ struct MMAV3UseRegOperand
   }
 };
 
+// TODO more context
+// Rewrite
+//   dot(local_alloc(elementwise(load(ptr))), rhs) #mma ->
+//   dot(elementwise(convert(load(ptr))), rhs) #mma,
+// (TODO::) if elementwise preserves data width??
+struct MMAV3HoistLHSLayoutConversion
+    : public OpRewritePattern<triton::nvidia_gpu::WarpGroupDotOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  // We want this to be a chain of elementwise ops only,
+  //   originating from a single load.
+  // To do this, we DFS upwards:
+  //   we don't iterate past loads
+  //   we return failure() if we see a non-elementwise, non-load op.
+  // Ignore BlockArguments.
+  // If there are any uses outside of the current set of ops, also failure():
+  //   TODO: determine if we need this case. It may be too conservative.
+  LogicalResult isValid(Operation* sourceOp) const {
+    std::stack<Operation*> st;
+    SetVector<Operation*> seen;
+    seen.insert(sourceOp);
+
+    auto insertOperands = [&](Operation* op) {
+      for (Value operand : op->getOperands()) {
+        if (isa<mlir::BlockArgument>(operand)) {
+          continue;
+        }
+        if (seen.insert(operand.getDefiningOp())) {
+          st.push(operand.getDefiningOp());
+        }
+      }
+    };
+
+    insertOperands(sourceOp);
+
+    while (!st.empty()) {
+      Operation* op = st.top();
+      st.pop();
+
+      if (isa<triton::LoadOp>(op)) {
+        continue;
+      }
+      
+      if (!op->hasTrait<OpTrait::Elementwise>()) {
+        llvm::outs() << "  (dberard) Non-elementwise op: " << *op << "\n";
+        return failure();
+      }
+      
+      insertOperands(op);
+    }
+
+    for (Operation* op : seen) {
+      if (op == sourceOp) {
+        continue;
+      }
+
+      for (Operation* user : op->getUsers()) {
+        if (!seen.contains(user)) {
+          llvm::outs() << "  (dberard) Unseen user " << *user << " [[of]] " << *op << "\n";
+          return failure();
+        }
+      }
+    }
+
+    return success();
+  }
+
+  LogicalResult matchAndRewrite(triton::nvidia_gpu::WarpGroupDotOp dotOp,
+                                PatternRewriter &rewriter) const override {
+    // Expect:
+    //   load = load(ptr)
+    //   result = elementwise(load)
+    //   alloc = local_alloc(result)
+    //   dot = dot(alloc, rhs)
+    // Convert to:
+    //   data = load(ptr)
+    //   cvt = convert(data) # mma
+    //   result = elementwise(cvt)
+    //   dot = dot(result, rhs)
+    //  
+
+    // TODO: fix all of this, it was just copied from the other pass
+    llvm::outs() << "  (dberard) before start\n";
+    auto alloc = dotOp.getOperand(0).getDefiningOp<LocalAllocOp>();
+    if (!alloc || !alloc.getSrc() || !alloc->hasOneUse())
+      return failure();
+
+    auto getEncoding = [](Value v) {
+      return cast<TensorOrMemDesc>(v.getType()).getEncoding();
+    };
+
+    // don't move into registers if we won't need it in registers anyway
+    auto src = alloc.getOperand(0).getDefiningOp();
+    if (isa<triton::LoadOp>(src))      
+      return failure();
+
+    llvm::outs() << "  (dberard) before checking if it's a shared encoding attr\n";
+    if (!isa<SharedEncodingAttr>(getEncoding(dotOp.getOperand(0))))
+      return failure();
+
+    // Check if this is valid
+    llvm::outs() << "  (dberard) before checking validity\n";
+    if (isValid(alloc).failed())
+      return failure();
+
+    auto srcTy = cast<RankedTensorType>(alloc.getSrc().getType());
+    // TODO(davidberard98): what am I supposed to put for kWidth?
+    // Do I need to implement SharedToDotOperandMMAv3 (there's a v2 file...)
+    auto dotOperandEnc = DotOperandEncodingAttr::get(
+        dotOp.getContext(), /*opIdx=*/0, getEncoding(dotOp.getResult()), /*kWidth=*/0);
+    auto newTy = RankedTensorType::get(srcTy.getShape(), srcTy.getElementType(),
+                                       dotOperandEnc);
+    Value newOperand =
+        rewriter.create<ConvertLayoutOp>(dotOp.getLoc(), newTy, alloc.getSrc());
+    rewriter.modifyOpInPlace(dotOp, [&]() { dotOp.setOperand(0, newOperand); });
+    return success();
+  }
+};
+
 } // namespace
 
 #define GEN_PASS_DEF_TRITONGPUOPTIMIZEDOTOPERANDS
@@ -322,8 +442,10 @@ public:
 
     mlir::RewritePatternSet patterns(context);
     patterns.add<SwizzleShmemConvert>(context);
-    if (this->hoistLayoutConversion.getValue())
+    if (this->hoistLayoutConversion.getValue()) {
+      patterns.add<MMAV3HoistLHSLayoutConversion>(context);
       patterns.add<HoistLayoutConversion>(context);
+    }
     patterns.add<FuseTransHopper>(context);
     patterns.add<MMAV3UseRegOperand>(context);
     ConvertLayoutOp::getCanonicalizationPatterns(patterns, context);

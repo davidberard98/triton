@@ -621,8 +621,7 @@ unsigned getNumScratchElements(ArrayRef<unsigned> shape) {
 }
 
 namespace {
-template <typename OpT>
-bool supportMMAImpl(OpT op, int version) {
+template <typename OpT> bool supportMMAImpl(OpT op, int version) {
   // Refer to mma section for the data type supported by Volta and Hopper
   // Tensor Core in
   // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#warp-level-matrix-fragment-mma-884-f16

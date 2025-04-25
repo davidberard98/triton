@@ -175,7 +175,7 @@ static void threadValuesThroughWait(ttng::WarpGroupDotWaitOp wait,
     getBackwardSlice(v, &slice, options);
   }
 
-  for (Operation* dot : asyncDots) {
+  for (Operation *dot : asyncDots) {
     for (Value operand : dot->getOperands()) {
       if (isa<ttg::MemDescType>(operand.getType())) {
         newOperands.insert(operand);
@@ -257,8 +257,7 @@ static void threadValuesThroughWait(ttng::WarpGroupDotWaitOp wait,
 // in the loop's iter_args.  (Rule (2) above ensures this is well-defined.)
 //
 template <typename OpT>
-static std::optional<int> dotCanBeProperlyAsync(OpT dotOp,
-                                                scf::ForOp forOp) {
+static std::optional<int> dotCanBeProperlyAsync(OpT dotOp, scf::ForOp forOp) {
   LDBG("Considering whether to make MMAv3 dot properly async: " << dotOp);
 
   // Rule 1: All shmem operands are multi-buffered.
@@ -347,7 +346,8 @@ static std::optional<int> dotCanBeProperlyAsync(OpT dotOp,
   // Rule 3a: Are the only users of the dot's result from iteration i-1 other
   // MMAv3 dots?  If so, we're done, this dot can be properly async.
   if (llvm::all_of(iterArg.getUses(), [&](OpOperand &use) {
-        return isa<ttng::WarpGroupDotOp, ttng::SparseWarpGroupDotOp>(use.getOwner()) &&
+        return isa<ttng::WarpGroupDotOp, ttng::SparseWarpGroupDotOp>(
+                   use.getOwner()) &&
                use.getOperandNumber() == 2;
       })) {
     return iterArgIdx;
@@ -461,16 +461,18 @@ static void insertAsyncWarpGroupDotWaitInLoop(
   threadValuesThroughWait(wait, addlWaitOperands);
 }
 
-template<typename OpT>
-void processWarpGroupDotOp(IRRewriter& builder, llvm::MapVector<Operation *, int>& properlyAsyncDots, scf::ForOp forOp, OpT dotOp) {
+template <typename OpT>
+void processWarpGroupDotOp(IRRewriter &builder,
+                           llvm::MapVector<Operation *, int> &properlyAsyncDots,
+                           scf::ForOp forOp, OpT dotOp) {
   dotOp.setIsAsync(true);
   if (auto iterArgIdx = dotCanBeProperlyAsync(dotOp, forOp)) {
     properlyAsyncDots[dotOp] = *iterArgIdx;
   } else {
     builder.setInsertionPointAfter(dotOp);
-    auto wait = builder.create<ttng::WarpGroupDotWaitOp>(
-        dotOp.getLoc(), ArrayRef<Value>{},
-        /*pendings=*/0);
+    auto wait = builder.create<ttng::WarpGroupDotWaitOp>(dotOp.getLoc(),
+                                                         ArrayRef<Value>{},
+                                                         /*pendings=*/0);
     SmallVector<Value> waitOperands = {dotOp.getResult()};
     threadValuesThroughWait(wait, waitOperands);
   }
@@ -503,8 +505,10 @@ void triton::asyncLaunchDots(scf::ForOp forOp) {
   for (auto WarpGroupDotOp : forOp.getBody()->getOps<ttng::WarpGroupDotOp>()) {
     processWarpGroupDotOp(builder, properlyAsyncDots, forOp, WarpGroupDotOp);
   }
-  for (auto SparseWarpGroupDotOp : forOp.getBody()->getOps<ttng::SparseWarpGroupDotOp>()) {
-    processWarpGroupDotOp(builder, properlyAsyncDots, forOp, SparseWarpGroupDotOp);
+  for (auto SparseWarpGroupDotOp :
+       forOp.getBody()->getOps<ttng::SparseWarpGroupDotOp>()) {
+    processWarpGroupDotOp(builder, properlyAsyncDots, forOp,
+                          SparseWarpGroupDotOp);
   }
 
   if (properlyAsyncDots.empty()) {

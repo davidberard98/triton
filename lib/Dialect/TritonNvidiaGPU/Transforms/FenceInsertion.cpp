@@ -85,7 +85,7 @@ private:
       return false;
     // reach convertlayout
     if (op && isa<ttg::LocalAllocOp>(op)) {
-      llvm::outs() <<"   LOCAL ALLOC!!\n";
+      llvm::outs() << "   LOCAL ALLOC!!\n";
       llvm::outs() << *op->getParentOp() << "\n";
       llvm::outs().flush();
       int x = 5;

@@ -102,9 +102,9 @@ bool SparseWarpGroupDotOp::verifyDims() {
 }
 
 mlir::LogicalResult SparseWarpGroupDotOp::inferReturnTypes(
-  MLIRContext *context, std::optional<Location> location, ValueRange operands,
-  DictionaryAttr attributes, OpaqueProperties properties, RegionRange regions,
-  SmallVectorImpl<Type> &inferredReturnTypes) {
+    MLIRContext *context, std::optional<Location> location, ValueRange operands,
+    DictionaryAttr attributes, OpaqueProperties properties, RegionRange regions,
+    SmallVectorImpl<Type> &inferredReturnTypes) {
   // type is the same as the accumulator
   auto accTy = cast<RankedTensorType>(operands[2].getType());
   inferredReturnTypes.push_back(accTy);
@@ -127,18 +127,17 @@ mlir::LogicalResult SparseWarpGroupDotOp::inferReturnTypes(
   return mlir::success();
 }
 
-
 void SparseWarpGroupDotOp::getEffects(
-  SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
-      &effects) {
-auto &a = getAMutable();
-auto &b = getBMutable();
-if (isa<mlir::triton::gpu::MemDescType>(a.get().getType()))
-  effects.emplace_back(MemoryEffects::Read::get(), &a,
-                       mlir::triton::gpu::SharedMemory::get());
-if (isa<mlir::triton::gpu::MemDescType>(b.get().getType()))
-  effects.emplace_back(MemoryEffects::Read::get(), &b,
-                       mlir::triton::gpu::SharedMemory::get());
+    SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
+        &effects) {
+  auto &a = getAMutable();
+  auto &b = getBMutable();
+  if (isa<mlir::triton::gpu::MemDescType>(a.get().getType()))
+    effects.emplace_back(MemoryEffects::Read::get(), &a,
+                         mlir::triton::gpu::SharedMemory::get());
+  if (isa<mlir::triton::gpu::MemDescType>(b.get().getType()))
+    effects.emplace_back(MemoryEffects::Read::get(), &b,
+                         mlir::triton::gpu::SharedMemory::get());
 }
 
 bool SparseWarpGroupDotOp::needsPartialAccumulator() {

@@ -525,13 +525,11 @@ static std::vector<std::string> getOutputConstraintsWGMMA(OpT op) {
 
   auto outputStructType = dyn_cast<LLVM::LLVMStructType>(resultType);
   uint32_t numOutputRegs = outputStructType.getBody().size();
-  std::string output =
-      outputStructType.getBody().front().isF32() ? "=f" : "=r";
+  std::string output = outputStructType.getBody().front().isF32() ? "=f" : "=r";
   return std::vector<std::string>(numOutputRegs, output);
 }
 
-template <typename OpT>
-static std::string getPtxAsmWGMMA(OpT op) {
+template <typename OpT> static std::string getPtxAsmWGMMA(OpT op) {
   using namespace ttn;
   auto opA = op.getOpA();
   auto opB = op.getOpB();
@@ -572,18 +570,17 @@ static std::string getPtxAsmWGMMA(OpT op) {
       (eltTypeC == WGMMAEltType::f16 || eltTypeC == WGMMAEltType::f32) &&
       (m == 64 && 8 <= n && n <= 256 && k == 16 * kFactor);
   supported |= (eltTypeA == WGMMAEltType::bf16) &&
-                (eltTypeB == WGMMAEltType::bf16) &&
-                (eltTypeC == WGMMAEltType::f32) &&
-                (m == 64 && 8 <= n && n <= 256 && k == 16 * kFactor);
+               (eltTypeB == WGMMAEltType::bf16) &&
+               (eltTypeC == WGMMAEltType::f32) &&
+               (m == 64 && 8 <= n && n <= 256 && k == 16 * kFactor);
   needTransArgs = supported;
   floatTypeWGMMA = supported;
   // Below instructions do not support transposing
   if (!supported && !transA && !transB) {
     supported |= (eltTypeA == WGMMAEltType::tf32) &&
-                  (eltTypeB == WGMMAEltType::tf32) &&
-                  (eltTypeC == WGMMAEltType::f32) &&
-                  (!isSparse) &&
-                  (m == 64 && 8 <= n && n <= 256 && k == 8 * kFactor);
+                 (eltTypeB == WGMMAEltType::tf32) &&
+                 (eltTypeC == WGMMAEltType::f32) && (!isSparse) &&
+                 (m == 64 && 8 <= n && n <= 256 && k == 8 * kFactor);
     supported |=
         (eltTypeA == WGMMAEltType::e4m3 || eltTypeA == WGMMAEltType::e5m2) &&
         (eltTypeB == WGMMAEltType::e4m3 || eltTypeB == WGMMAEltType::e5m2) &&
@@ -592,14 +589,12 @@ static std::string getPtxAsmWGMMA(OpT op) {
     floatTypeWGMMA = supported;
     // Below instructions are integer-based
     supported |= (eltTypeA == WGMMAEltType::s8) &&
-                  (eltTypeB == WGMMAEltType::s8) &&
-                  (eltTypeC == WGMMAEltType::s32) &&
-                  (!isSparse) &&
-                  (m == 64 && 8 <= n && n <= 224 && k == 32 * kFactor);
+                 (eltTypeB == WGMMAEltType::s8) &&
+                 (eltTypeC == WGMMAEltType::s32) && (!isSparse) &&
+                 (m == 64 && 8 <= n && n <= 224 && k == 32 * kFactor);
   }
   assert(supported && "WGMMA type or shape is not supported");
 
-  
   // Operands
   uint32_t asmOpIdx = 0;
   std::string args = "";
@@ -621,8 +616,7 @@ static std::string getPtxAsmWGMMA(OpT op) {
     uint32_t numARegs = structTypeA.getBody().size();
     args += "{";
     for (uint32_t i = 0; i < numARegs; ++i) {
-      args +=
-          "$" + std::to_string(asmOpIdx++) + (i == numARegs - 1 ? "" : ",");
+      args += "$" + std::to_string(asmOpIdx++) + (i == numARegs - 1 ? "" : ",");
     }
     args += "}, ";
   } else {
@@ -660,11 +654,12 @@ static std::string getPtxAsmWGMMA(OpT op) {
 
   std::string maybeSp = isSparse ? ".sp" : "";
 
-  auto ptxAsm = "wgmma.mma_async" + maybeSp + ".sync.aligned"
+  auto ptxAsm = "wgmma.mma_async" + maybeSp +
+                ".sync.aligned"
                 ".m" +
                 std::to_string(m) + "n" + std::to_string(n) + "k" +
-                std::to_string(k) + "." + stringifyEnum(eltTypeC).str() +
-                "." + stringifyEnum(eltTypeA).str() + "." +
+                std::to_string(k) + "." + stringifyEnum(eltTypeC).str() + "." +
+                stringifyEnum(eltTypeA).str() + "." +
                 stringifyEnum(eltTypeB).str() + " " + args + ";";
   return ptxAsm;
 }
@@ -683,7 +678,7 @@ public:
 
 class SparseWGMMAOpPattern : public OpRewritePattern<ttn::SparseWGMMAOp> {
 public:
-using OpRewritePattern<ttn::SparseWGMMAOp>::OpRewritePattern;
+  using OpRewritePattern<ttn::SparseWGMMAOp>::OpRewritePattern;
 
   LogicalResult matchAndRewrite(ttn::SparseWGMMAOp op,
                                 PatternRewriter &rewriter) const override {
@@ -825,11 +820,10 @@ public:
     patterns.add<NVGPUOpGenericPattern<ttn::ClusterCTAIdOp>>(
         context, kClusterCtaIdOp, Constraints({"=r"}), Constraints());
 
-    patterns
-        .add<FenceAsyncSharedOpPattern, LoadMatrixOpPattern,
-             StoreMatrixOpPattern, ClusterArriveOpPattern, WGMMAOpPattern, SparseWGMMAOpPattern,
-             LoadAcquireOpPattern, WGMMAWaitGroupOpPattern, WarpIdOpPattern>(
-            context);
+    patterns.add<FenceAsyncSharedOpPattern, LoadMatrixOpPattern,
+                 StoreMatrixOpPattern, ClusterArriveOpPattern, WGMMAOpPattern,
+                 SparseWGMMAOpPattern, LoadAcquireOpPattern,
+                 WGMMAWaitGroupOpPattern, WarpIdOpPattern>(context);
 
     if (applyPatternsGreedily(mod, std::move(patterns)).failed())
       signalPassFailure();

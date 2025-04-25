@@ -126,9 +126,10 @@ TritonGPUConversionTarget::TritonGPUConversionTarget(
   };
 
   addDynamicallyLegalOp<triton::DotOp>(dotOpLegality);
-  addDynamicallyLegalOp<triton::SparseDotOp>([&dotOpLegality](triton::SparseDotOp sparseDotOp) {
-    if (!dotOpLegality(sparseDotOp))
-      return false;
-    return sparseDotOp.getAMeta().getType().getEncoding() != nullptr;
-  });
+  addDynamicallyLegalOp<triton::SparseDotOp>(
+      [&dotOpLegality](triton::SparseDotOp sparseDotOp) {
+        if (!dotOpLegality(sparseDotOp))
+          return false;
+        return sparseDotOp.getAMeta().getType().getEncoding() != nullptr;
+      });
 }

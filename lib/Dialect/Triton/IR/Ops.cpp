@@ -357,11 +357,11 @@ bool DotScaledOp::verifyOutputDims() {
 
 //-- SparseDotOp --
 namespace {
-int kSparseMetadataBitWidth = 16;  // metadata is packed into i16 tensor
-int kSparsePackedValuesPerMetadataElement = (
-  kSparseMetadataBitWidth  // number of bits in a metadata element
-  / 2                      // number of metadata bits per packed value
-);
+int kSparseMetadataBitWidth = 16; // metadata is packed into i16 tensor
+int kSparsePackedValuesPerMetadataElement =
+    (kSparseMetadataBitWidth // number of bits in a metadata element
+     / 2                     // number of metadata bits per packed value
+    );
 } // namespace
 
 LogicalResult SparseDotOp::verify() {
@@ -417,7 +417,8 @@ bool SparseDotOp::verifyDims() {
   auto metaShape = this->getAMeta().getType().getShape();
   if (metaShape[metaShape.size() - 2] != aShape[aShape.size() - 2])
     return false;
-  if (metaShape[metaShape.size() - 1] * kSparsePackedValuesPerMetadataElement != aShape[aShape.size() - 1])
+  if (metaShape[metaShape.size() - 1] * kSparsePackedValuesPerMetadataElement !=
+      aShape[aShape.size() - 1])
     return false;
 
   return true;

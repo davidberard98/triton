@@ -664,7 +664,9 @@ SmallVector<unsigned> AMDRotatingSharedEncodingAttr::getCTASplitNum() const {
   return SmallVector<unsigned>(getCTALayout().getCTASplitNum());
 }
 
-static SmallVector<unsigned> getCTASplitNumForDotOperand(const ArrayRef<unsigned>& parentCTASplitNum, unsigned opIdx) {
+static SmallVector<unsigned>
+getCTASplitNumForDotOperand(const ArrayRef<unsigned> &parentCTASplitNum,
+                            unsigned opIdx) {
   SmallVector<unsigned> res(parentCTASplitNum);
   auto rank = res.size();
   assert(rank == 2 || rank == 3 && "Invalid dotLayout");
@@ -736,8 +738,9 @@ LogicalResult DotOperandEncodingAttr::verify(
 
 SmallVector<unsigned> NvidiaSparseMetaEncodingAttr::getRepOrder() const {
   auto parent = mlir::dyn_cast<MmaEncodingTrait>(getParent());
-  assert(parent && "getRepOrder is defined on NvidiaSparseMetaEncodingAttr only "
-                   "when its parent is a MmaEncodingTrait");
+  assert(parent &&
+         "getRepOrder is defined on NvidiaSparseMetaEncodingAttr only "
+         "when its parent is a MmaEncodingTrait");
   return parent.getRepOrderForOperand(0);
 }
 SmallVector<unsigned> NvidiaSparseMetaEncodingAttr::getCTAsPerCGA() const {
@@ -747,9 +750,9 @@ SmallVector<unsigned> NvidiaSparseMetaEncodingAttr::getCTAOrder() const {
   return ::getCTAOrder(getParent());
 }
 SmallVector<unsigned> NvidiaSparseMetaEncodingAttr::getCTASplitNum() const {
-  return getCTASplitNumForDotOperand(::getCTASplitNum(getParent()), /*opIdx*/0);
+  return getCTASplitNumForDotOperand(::getCTASplitNum(getParent()),
+                                     /*opIdx*/ 0);
 }
-
 
 //===----------------------------------------------------------------------===//
 // Blocked Encoding

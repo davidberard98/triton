@@ -209,7 +209,7 @@ private:
 };
 
 template <typename OpT>
-struct TritonGenericDotPattern: public OpConversionPattern<OpT> {
+struct TritonGenericDotPattern : public OpConversionPattern<OpT> {
   using OpConversionPattern<OpT>::OpConversionPattern;
 
   struct ConvertedArgs {
@@ -217,16 +217,19 @@ struct TritonGenericDotPattern: public OpConversionPattern<OpT> {
     Value b;
     Value c;
     RankedTensorType retType;
-    ConvertedArgs(Value a, Value b, Value c, RankedTensorType retType) : a(a), b(b), c(c), retType(retType) {}
+    ConvertedArgs(Value a, Value b, Value c, RankedTensorType retType)
+        : a(a), b(b), c(c), retType(retType) {}
   };
 
   // Shared implementation between DotOp and SparseDotOp
   // to handle a, b, c, and retType.
-  std::optional<ConvertedArgs> convertCommonArgs(OpT op, typename OpT::Adaptor adaptor,
-                                                 ConversionPatternRewriter& rewriter) const {
+  std::optional<ConvertedArgs>
+  convertCommonArgs(OpT op, typename OpT::Adaptor adaptor,
+                    ConversionPatternRewriter &rewriter) const {
     RankedTensorType origType = op.getType();
     auto origShape = origType.getShape();
-    auto typeConverter = OpConversionPattern<OpT>::template getTypeConverter<mlir::TritonGPUTypeConverter>();
+    auto typeConverter = OpConversionPattern<OpT>::template getTypeConverter<
+        mlir::TritonGPUTypeConverter>();
     int numWarps = typeConverter->getNumWarps();
     int threadsPerWarp = typeConverter->getThreadsPerWarp();
     int numCTAs = typeConverter->getNumCTAs();
@@ -250,8 +253,8 @@ struct TritonGenericDotPattern: public OpConversionPattern<OpT> {
     for (unsigned i = 0; i < rank; ++i)
       retOrder[i] = rank - 1 - i;
     Attribute dEncoding = triton::gpu::BlockedEncodingAttr::get(
-        OpConversionPattern<OpT>::getContext(), origShape, retSizePerThread, retOrder, numWarps,
-        threadsPerWarp, numCTAs);
+        OpConversionPattern<OpT>::getContext(), origShape, retSizePerThread,
+        retOrder, numWarps, threadsPerWarp, numCTAs);
     RankedTensorType retType =
         RankedTensorType::get(origShape, origType.getElementType(), dEncoding);
     // a & b must be of smem layout
@@ -285,34 +288,40 @@ struct TritonGenericDotPattern: public OpConversionPattern<OpT> {
     return ConvertedArgs(a, b, c, retType);
   }
 
-  template <class T>
-  struct dependent_false : std::false_type {};
+  template <class T> struct dependent_false : std::false_type {};
 
   // Specialized implementations for DotOp and SparseDotOp are provided below
   LogicalResult
   matchAndRewrite(OpT op, typename OpT::Adaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    static_assert(dependent_false<OpT>::value && "TritonGenericDotPattern<OpT>::matchAndRewrite not implemented for this op type");
+    static_assert(dependent_false<OpT>::value &&
+                  "TritonGenericDotPattern<OpT>::matchAndRewrite not "
+                  "implemented for this op type");
     return failure();
   }
 };
 
 template <>
-LogicalResult TritonGenericDotPattern<triton::DotOp>::matchAndRewrite(triton::DotOp op, triton::DotOp::Adaptor adaptor, ConversionPatternRewriter& rewriter) const {
+LogicalResult TritonGenericDotPattern<triton::DotOp>::matchAndRewrite(
+    triton::DotOp op, triton::DotOp::Adaptor adaptor,
+    ConversionPatternRewriter &rewriter) const {
   auto args = convertCommonArgs(op, adaptor, rewriter);
   if (!args.has_value()) {
     return failure();
   }
-  
+
   addNamedAttrs(rewriter.replaceOpWithNewOp<triton::DotOp>(
-                    op, args->retType, args->a, args->b, args->c, adaptor.getInputPrecision(),
+                    op, args->retType, args->a, args->b, args->c,
+                    adaptor.getInputPrecision(),
                     adaptor.getMaxNumImpreciseAcc()),
                 adaptor.getAttributes());
   return success();
 }
 
 template <>
-LogicalResult TritonGenericDotPattern<triton::SparseDotOp>::matchAndRewrite(triton::SparseDotOp op, triton::SparseDotOp::Adaptor adaptor, ConversionPatternRewriter& rewriter) const {
+LogicalResult TritonGenericDotPattern<triton::SparseDotOp>::matchAndRewrite(
+    triton::SparseDotOp op, triton::SparseDotOp::Adaptor adaptor,
+    ConversionPatternRewriter &rewriter) const {
   auto args = convertCommonArgs(op, adaptor, rewriter);
   if (!args.has_value()) {
     return failure();
@@ -324,13 +333,18 @@ LogicalResult TritonGenericDotPattern<triton::SparseDotOp>::matchAndRewrite(trit
     return failure();
   Value aMeta = adaptor.getAMeta();
   if (!isa<triton::gpu::NvidiaSparseMetaEncodingAttr>(aMetaEncoding)) {
-    Attribute encoding = NvidiaSparseMetaEncodingAttr::get(getContext(), cast<triton::gpu::DistributedEncodingTrait>(args->retType.getEncoding()));
-    auto tensorType = RankedTensorType::get(aMetaType.getShape(), aMetaType.getElementType(), encoding);
-    aMeta = rewriter.create<triton::gpu::ConvertLayoutOp>(aMeta.getLoc(), tensorType, aMeta);
+    Attribute encoding = NvidiaSparseMetaEncodingAttr::get(
+        getContext(), cast<triton::gpu::DistributedEncodingTrait>(
+                          args->retType.getEncoding()));
+    auto tensorType = RankedTensorType::get(
+        aMetaType.getShape(), aMetaType.getElementType(), encoding);
+    aMeta = rewriter.create<triton::gpu::ConvertLayoutOp>(aMeta.getLoc(),
+                                                          tensorType, aMeta);
   }
-  
+
   addNamedAttrs(rewriter.replaceOpWithNewOp<triton::SparseDotOp>(
-                    op, args->retType, args->a, args->b, args->c, aMeta, adaptor.getInputPrecision(),
+                    op, args->retType, args->a, args->b, args->c, aMeta,
+                    adaptor.getInputPrecision(),
                     adaptor.getMaxNumImpreciseAcc()),
                 adaptor.getAttributes());
   return success();
@@ -663,7 +677,8 @@ void populateTritonPatterns(TritonGPUTypeConverter &typeConverter,
       GenericOpPattern<triton::ReduceReturnOp>, TritonScanPattern,
       GenericOpPattern<triton::ScanReturnOp>,
       GenericOpPattern<triton::MakeRangeOp>, TritonExpandDimsPattern,
-      TritonTransPattern, TritonGenericDotPattern<triton::DotOp>, TritonGenericDotPattern<triton::SparseDotOp>,
+      TritonTransPattern, TritonGenericDotPattern<triton::DotOp>,
+      TritonGenericDotPattern<triton::SparseDotOp>,
       GatherScatterOpPattern<DescriptorGatherOp>,
       GatherScatterOpPattern<DescriptorScatterOp>,
       GatherScatterOpPattern<triton::nvidia_gpu::AsyncTMAGatherOp>,
@@ -679,8 +694,7 @@ void populateTritonPatterns(TritonGPUTypeConverter &typeConverter,
       GenericOpPattern<triton::ExperimentalTensormapCreateOp>,
       GenericOpPattern<triton::ExperimentalTensormapFenceproxyAcquireOp>,
       // this assumes the right layout will be set later for dot scaled.
-      GenericOpPattern<triton::DotScaledOp>,
-      GenericOpPattern<triton::CallOp>,
+      GenericOpPattern<triton::DotScaledOp>, GenericOpPattern<triton::CallOp>,
       TritonFuncOpPattern>(typeConverter, context);
 }
 // Proton patterns

@@ -1650,7 +1650,8 @@ NvidiaSparseMetaEncodingAttr::toLinearLayout(ArrayRef<int64_t> shape) const {
       warpBasis.push_back({0, 0});
     }
   } else {
-    assert(mmaEnc.isAmpere() && "SparseDot only supported w/ Ampere and Hopper");
+    assert(mmaEnc.isAmpere() &&
+           "SparseDot only supported w/ Ampere and Hopper");
     assert(false && "Ampere not implemented yet");
   }
 
@@ -1666,8 +1667,7 @@ NvidiaSparseMetaEncodingAttr::toLinearLayout(ArrayRef<int64_t> shape) const {
 
   auto ctaLayout = getCTALayout(getParent());
 
-  auto res =
-      combineCtaCgaWithShape(layoutPerCTA, ctaLayout, shape);
+  auto res = combineCtaCgaWithShape(layoutPerCTA, ctaLayout, shape);
   return res;
 }
 

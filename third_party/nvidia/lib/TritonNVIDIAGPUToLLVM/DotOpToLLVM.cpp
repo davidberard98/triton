@@ -22,10 +22,11 @@ LogicalResult convertWGMMA(triton::nvidia_gpu::WarpGroupDotOp op,
                            const LLVMTypeConverter *typeConverter,
                            ConversionPatternRewriter &rewriter, Value thread);
 
-LogicalResult convertWGMMA(triton::nvidia_gpu::SparseWarpGroupDotOp op,
-                           triton::nvidia_gpu::SparseWarpGroupDotOp::Adaptor adaptor,
-                           const LLVMTypeConverter *typeConverter,
-                           ConversionPatternRewriter &rewriter, Value thread);
+LogicalResult
+convertWGMMA(triton::nvidia_gpu::SparseWarpGroupDotOp op,
+             triton::nvidia_gpu::SparseWarpGroupDotOp::Adaptor adaptor,
+             const LLVMTypeConverter *typeConverter,
+             ConversionPatternRewriter &rewriter, Value thread);
 namespace {
 struct DotOpConversion : public ConvertOpToLLVMPattern<triton::DotOp> {
   using ConvertOpToLLVMPattern<triton::DotOp>::ConvertOpToLLVMPattern;
@@ -46,7 +47,9 @@ struct DotOpConversion : public ConvertOpToLLVMPattern<triton::DotOp> {
 
     NvidiaMmaEncodingAttr mmaLayout = dyn_cast<NvidiaMmaEncodingAttr>(
         cast<RankedTensorType>(D.getType()).getEncoding());
-    if (!isOuter && mmaLayout && supportMMA(cast<DotOpInterface>(op.getOperation()), mmaLayout.getVersionMajor())) {
+    if (!isOuter && mmaLayout &&
+        supportMMA(cast<DotOpInterface>(op.getOperation()),
+                   mmaLayout.getVersionMajor())) {
       if (mmaLayout.isTuring())
         return convertMMA1688(op, adaptor, getTypeConverter(), rewriter);
       if (mmaLayout.isAmpere())
@@ -66,8 +69,7 @@ struct DotOpConversion : public ConvertOpToLLVMPattern<triton::DotOp> {
 };
 
 template <typename OpT>
-struct GenericWarpGroupDotOpConversion
-    : public ConvertOpToLLVMPattern<OpT> {
+struct GenericWarpGroupDotOpConversion : public ConvertOpToLLVMPattern<OpT> {
   using ConvertOpToLLVMPattern<OpT>::ConvertOpToLLVMPattern;
 
   LogicalResult
@@ -89,8 +91,10 @@ struct GenericWarpGroupDotOpConversion
     if (!isOuter && mmaLayout &&
         supportMMA(op.getOperand(0), mmaLayout.getVersionMajor())) {
       if (mmaLayout.isHopper()) {
-        return convertWGMMA(op, adaptor, ConversionPattern::getTypeConverter<LLVMTypeConverter>(), rewriter,
-                            getThreadId(rewriter, loc));
+        return convertWGMMA(
+            op, adaptor,
+            ConversionPattern::getTypeConverter<LLVMTypeConverter>(), rewriter,
+            getThreadId(rewriter, loc));
       }
 
       llvm::report_fatal_error(
@@ -102,8 +106,10 @@ struct GenericWarpGroupDotOpConversion
   }
 };
 
-using WarpGroupDotOpConversion = GenericWarpGroupDotOpConversion<triton::nvidia_gpu::WarpGroupDotOp>;
-using SparseWarpGroupDotOpConversion = GenericWarpGroupDotOpConversion<triton::nvidia_gpu::SparseWarpGroupDotOp>;
+using WarpGroupDotOpConversion =
+    GenericWarpGroupDotOpConversion<triton::nvidia_gpu::WarpGroupDotOp>;
+using SparseWarpGroupDotOpConversion =
+    GenericWarpGroupDotOpConversion<triton::nvidia_gpu::SparseWarpGroupDotOp>;
 
 struct WarpGroupDotWaitOpConversion
     : public ConvertOpToLLVMPattern<triton::nvidia_gpu::WarpGroupDotWaitOp> {

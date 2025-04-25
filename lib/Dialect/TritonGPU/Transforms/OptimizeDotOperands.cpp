@@ -91,6 +91,7 @@ public:
                                 PatternRewriter &rewriter) const override {
     if (!allocOp.getSrc() || !allocOp->hasOneUse() ||
         !isa<triton::nvidia_gpu::WarpGroupDotOp,
+             triton::nvidia_gpu::SparseWarpGroupDotOp,
              triton::nvidia_gpu::MMAv5OpInterface>(
             *allocOp->getUsers().begin()))
       return failure();

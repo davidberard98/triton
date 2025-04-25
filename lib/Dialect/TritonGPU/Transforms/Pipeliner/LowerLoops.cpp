@@ -516,7 +516,8 @@ bool loadRequiresAdditionalBuffer(Operation *loadOp) {
         dyn_cast<ttg::LocalAllocOp>(*loadOp->getUsers().begin());
     if (alloc) {
       return llvm::any_of(alloc->getUsers(), [&](Operation *op) {
-        return isa<ttng::WarpGroupDotOp>(skipViewOps(op));
+        return isa<ttng::WarpGroupDotOp, ttng::SparseWarpGroupDotOp>(
+            skipViewOps(op));
       });
     }
   }
@@ -800,7 +801,7 @@ scf::ForOp lowerTMADescriptors(scf::ForOp forOp, CoarseSchedule &schedule) {
   llvm::MapVector<Operation *, Value> tmaBufferMapping;
   int maxStage = schedule.getNumStages() - 1;
   for (auto &op : forOp.getBody()->without_terminator()) {
-    if (auto wgMmaOp = dyn_cast<ttng::WarpGroupDotOp>(&op)) {
+    if (isa<ttng::WarpGroupDotOp, ttng::SparseWarpGroupDotOp>(&op)) {
       // Hopper only: Add one more buffer slice if there is a WarpGroupDotOp,
       // as if it will be pipelined, we will effectively make the pipeline
       // one stage longer.

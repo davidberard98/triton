@@ -1617,11 +1617,6 @@ NvidiaSparseMetaEncodingAttr::toLinearLayout(ArrayRef<int64_t> shape) const {
   SmallVector<unsigned> order = {0, 1};
   SmallVector<StringAttr> outDimNames = standardOutDimNames(ctx, rank);
 
-  if (!llvm::dyn_cast<NvidiaMmaEncodingAttr>(getParent())) {
-    llvm::outs() << " NOT A NVIDIAMMAENCODINGATTR" << "\n";
-    llvm::outs().flush();
-  }
-
   auto mmaEnc = llvm::cast<NvidiaMmaEncodingAttr>(getParent());
   auto warpsPerCTA = mmaEnc.getWarpsPerCTA();
   std::vector<std::vector<int32_t>> warpBasis;

@@ -27,7 +27,7 @@ namespace gpu {
 namespace {
 
 // Get the highest version supported for the hardware and the dot.
-static int getMMAVersionSafe(int computeCapability, DotOp op) {
+static int getMMAVersionSafe(int computeCapability, DotOpInterface op) {
   // List supported mma version in order of preference.
   SmallVector<int> versionsSupported;
   if (computeCapability < 75) {
@@ -52,7 +52,7 @@ static int getMMAVersionSafe(int computeCapability, DotOp op) {
   return 0;
 }
 
-SmallVector<unsigned> warpsPerTileV2(DotOp dotOp, const ArrayRef<int64_t> shape,
+SmallVector<unsigned> warpsPerTileV2(DotOpInterface dotOp, const ArrayRef<int64_t> shape,
                                      int numWarps) {
   auto rank = shape.size();
   // Early exit for batched matmul
@@ -66,15 +66,15 @@ SmallVector<unsigned> warpsPerTileV2(DotOp dotOp, const ArrayRef<int64_t> shape,
   auto slices = multiRootGetSlice(dotOp, {filter}, {filter});
   bool hasChainedDot = false;
   for (Operation *op : slices) {
-    if (isa<DotOp>(op) && (op != dotOp)) {
-      auto chainedDot = cast<DotOp>(op);
-      auto resTy = chainedDot.getResult().getType();
+    if (isa<DotOpInterface>(op) && (op != dotOp)) {
+      auto chainedDot = cast<DotOpInterface>(op);
+      auto resTy = cast<RankedTensorType>(chainedDot->getResult(0).getType());
       if (resTy.getRank() != rank) {
         continue;
       }
       if (auto mmaEncoding =
               dyn_cast<NvidiaMmaEncodingAttr>(resTy.getEncoding())) {
-        return to_vector(mmaEncoding.getWarpsPerCTA());
+        return llvm::to_vector(mmaEncoding.getWarpsPerCTA());
       }
       hasChainedDot = true;
     }
@@ -117,10 +117,10 @@ SmallVector<unsigned> warpsPerTileV2(DotOp dotOp, const ArrayRef<int64_t> shape,
 }
 
 SmallVector<unsigned, 2>
-warpsPerTileV3(DotOp dotOp, const ArrayRef<int64_t> shape, int numWarps,
+warpsPerTileV3(DotOpInterface dotOp, const ArrayRef<int64_t> shape, int numWarps,
                const SmallVector<unsigned, 3> &instrShape) {
   SetVector<Operation *> slices;
-  mlir::getForwardSlice(dotOp.getResult(), &slices);
+  mlir::getForwardSlice(dotOp->getResult(0), &slices);
   // Contains a chained dot. We prefer to assign warps to one axis
   // to facilitate use cases like flash attention, allowing reductions within
   // the same warp.
@@ -213,7 +213,7 @@ getSharedMemoryScale(Value arg, mlir::PatternRewriter &rewriter, Location loc) {
 }
 
 SmallVector<unsigned, 3>
-getWarpsPerTile(DotOp dotOp, const ArrayRef<int64_t> shape, int version,
+getWarpsPerTile(DotOpInterface dotOp, const ArrayRef<int64_t> shape, int version,
                 int numWarps, const SmallVector<unsigned, 3> &instrShape) {
   switch (version) {
   case 2:
@@ -274,17 +274,45 @@ static int computeOrigBitWidth(Value x) {
   return origBitWidth;
 }
 
-class BlockedToMMA : public mlir::OpRewritePattern<DotOp> {
+template <typename OpT>
+class BlockedToMMA : public mlir::OpRewritePattern<OpT> {
   int computeCapability;
   mutable llvm::DenseMap<Operation *, unsigned> dotOpInstNs;
 
 public:
   BlockedToMMA(mlir::MLIRContext *context, int computeCapability, int benefit)
-      : OpRewritePattern<DotOp>(context, benefit),
+      : OpRewritePattern<OpT>(context, benefit),
         computeCapability(computeCapability) {}
 
+  template <class T>
+  struct dependent_false : std::false_type {};
+
+  Operation* createNewDotOp(
+    OpT dotOp,
+    mlir::PatternRewriter &rewriter,
+    RankedTensorType newRetType,
+    Value newA,
+    Value newB,
+    Value newAcc
+  ) const {
+    static_assert(dependent_false<OpT>::value && "BlockedToMMA<OpT>::createNewDotOp needs to be specialized");
+    return nullptr;
+  }
+
+  Operation* createNewWarpGroupDotOp(
+    OpT dotOp,
+    mlir::PatternRewriter &rewriter,
+    RankedTensorType newRetType,
+    Value newA,
+    Value newB,
+    Value newAcc
+  ) const {
+    static_assert(dependent_false<OpT>::value && "BlockedToMMA<OpT>::createNewWarpGroupDotOp needs to be specialized");
+    return nullptr;
+  }
+
   mlir::LogicalResult
-  matchAndRewrite(triton::DotOp dotOp,
+  matchAndRewrite(OpT dotOp,
                   mlir::PatternRewriter &rewriter) const override {
     if (computeCapability < 70)
       return failure();
@@ -380,9 +408,7 @@ public:
         a = getSharedMemoryMMAOperand(a, rewriter, 0, allowTranspose);
       }
       b = getSharedMemoryMMAOperand(b, rewriter, 1, allowTranspose);
-      newDot = rewriter.create<triton::nvidia_gpu::WarpGroupDotOp>(
-          dotOp.getLoc(), newRetType, a, b, newAcc, nullptr,
-          dotOp.getInputPrecision(), dotOp.getMaxNumImpreciseAcc(), false);
+      newDot = createNewWarpGroupDotOp(dotOp, rewriter, newRetType, a, b, newAcc);
     } else {
       // convert operands
       int minBitwidth =
@@ -390,9 +416,7 @@ public:
 
       a = getDotOperand(a, 0, minBitwidth);
       b = getDotOperand(b, 1, minBitwidth);
-      newDot = rewriter.create<DotOp>(dotOp.getLoc(), newRetType, a, b, newAcc,
-                                      dotOp.getInputPrecision(),
-                                      dotOp.getMaxNumImpreciseAcc());
+      newDot = createNewDotOp(dotOp, rewriter, newRetType, a, b, newAcc);
     }
     // convert dot instruction
     rewriter.replaceOpWithNewOp<ConvertLayoutOp>(origDotOp, origDotOp.getType(),
@@ -400,6 +424,85 @@ public:
     return success();
   }
 };
+
+
+template <>
+Operation* BlockedToMMA<triton::DotOp>::createNewWarpGroupDotOp(
+    triton::DotOp dotOp,
+    mlir::PatternRewriter &rewriter,
+    RankedTensorType newRetType,
+    Value newA,
+    Value newB,
+    Value newAcc
+) const {
+  return rewriter.create<triton::nvidia_gpu::WarpGroupDotOp>(
+      dotOp.getLoc(), newRetType, newA, newB, newAcc, nullptr,
+      dotOp.getInputPrecision(), dotOp.getMaxNumImpreciseAcc(), false);
+}
+
+template <>
+Operation* BlockedToMMA<triton::DotOp>::createNewDotOp(
+    triton::DotOp dotOp,
+    mlir::PatternRewriter &rewriter,
+    RankedTensorType newRetType,
+    Value newA,
+    Value newB,
+    Value newAcc
+) const {
+  return rewriter.create<triton::DotOp>(dotOp.getLoc(), newRetType, newA, newB, newAcc,
+                              dotOp.getInputPrecision(),
+                              dotOp.getMaxNumImpreciseAcc());
+}
+
+namespace {
+Value getSparseDotOpNewAMeta(triton::SparseDotOp sparseDotOp, mlir::PatternRewriter& rewriter, RankedTensorType newRetType) {
+  Value meta = sparseDotOp.getAMeta();
+  auto metaType = cast<RankedTensorType>(meta.getType());
+
+  // TODO(sparsity)
+  if (!dyn_cast<triton::gpu::NvidiaMmaEncodingAttr>(newRetType.getEncoding())) {
+    llvm::outs() << " SPARSE Dot op " << sparseDotOp << "\n";
+    llvm::outs().flush();
+  }
+
+  auto metaEncoding = NvidiaSparseMetaEncodingAttr::get(sparseDotOp->getContext(), cast<triton::gpu::NvidiaMmaEncodingAttr>(newRetType.getEncoding()));
+  metaType =
+      RankedTensorType::get(metaType.getShape(), metaType.getElementType(), metaEncoding);
+  meta = rewriter.create<ConvertLayoutOp>(meta.getLoc(), metaType, meta);
+  return meta;
+}
+};
+
+template <>
+Operation* BlockedToMMA<triton::SparseDotOp>::createNewWarpGroupDotOp(
+    triton::SparseDotOp sparseDotOp,
+    mlir::PatternRewriter &rewriter,
+    RankedTensorType newRetType,
+    Value newA,
+    Value newB,
+    Value newAcc
+) const {
+  // TODO(sparsity): actually implement SparseWarpGroupDotOp
+  auto newAMeta = getSparseDotOpNewAMeta(sparseDotOp, rewriter, newRetType);
+  return rewriter.create<triton::nvidia_gpu::SparseWarpGroupDotOp>(
+      sparseDotOp.getLoc(), newRetType, newA, newB, newAcc, newAMeta, nullptr,
+      sparseDotOp.getInputPrecision(), sparseDotOp.getMaxNumImpreciseAcc(), false);
+}
+
+template <>
+Operation* BlockedToMMA<triton::SparseDotOp>::createNewDotOp(
+    triton::SparseDotOp sparseDotOp,
+    mlir::PatternRewriter &rewriter,
+    RankedTensorType newRetType,
+    Value newA,
+    Value newB,
+    Value newAcc
+) const {
+  auto newAMeta = getSparseDotOpNewAMeta(sparseDotOp, rewriter, newRetType);
+  return rewriter.create<triton::SparseDotOp>(sparseDotOp.getLoc(), newRetType, newA, newB, newAcc, newAMeta,
+                              sparseDotOp.getInputPrecision(),
+                              sparseDotOp.getMaxNumImpreciseAcc());
+}
 
 // Pick the layout to match MXFP scales layout in register so that it can be
 // copied directly using tmem st.
@@ -899,7 +1002,8 @@ public:
     mlir::RewritePatternSet patterns(context);
     constexpr int benefitDefault = 1;
     constexpr int benefitMMAv5 = 10;
-    patterns.add<BlockedToMMA>(context, computeCapability, benefitDefault);
+    patterns.add<BlockedToMMA<triton::DotOp>>(context, computeCapability, benefitDefault);
+    patterns.add<BlockedToMMA<triton::SparseDotOp>>(context, computeCapability, benefitDefault);
     populateDecomposeScaledBlockedPatterns(patterns, benefitDefault);
     patterns.add<BlockedToMMAv5, ScaledBlockedToMMAv5>(
         context, computeCapability, benefitMMAv5);

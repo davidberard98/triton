@@ -620,7 +620,9 @@ unsigned getNumScratchElements(ArrayRef<unsigned> shape) {
   return product<unsigned>(shape);
 }
 
-bool supportMMA(triton::DotOp op, int version) {
+namespace {
+template <typename OpT>
+bool supportMMAImpl(OpT op, int version) {
   // Refer to mma section for the data type supported by Volta and Hopper
   // Tensor Core in
   // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#warp-level-matrix-fragment-mma-884-f16
@@ -680,6 +682,17 @@ bool supportMMA(triton::DotOp op, int version) {
     return op.getInputPrecision() == InputPrecision::TF32 && version >= 2;
   }
   return supportMMA(op.getA(), version) && supportMMA(op.getB(), version);
+}
+} // namespace
+
+bool supportMMA(triton::DotOpInterface op, int version) {
+  if (isa<triton::DotOp>(op)) {
+    return supportMMAImpl(cast<triton::DotOp>(op), version);
+  } else if (isa<triton::SparseDotOp>(op)) {
+    return supportMMAImpl(cast<triton::SparseDotOp>(op), version);
+  } else {
+    llvm_unreachable("supportMMA only implemented for DotOp and SparseDotOp");
+  }
 }
 
 bool supportMMA(Value value, int version) {

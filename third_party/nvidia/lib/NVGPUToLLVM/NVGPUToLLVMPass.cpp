@@ -479,178 +479,217 @@ public:
   }
 };
 
+template <typename OpT>
+static OperandsAndConstraints getOperandsAndConstraintsWGMMA(OpT op) {
+  OperandsAndConstraints operandsAndConstraints;
+  auto opA = op.getOpA();
+  auto opB = op.getOpB();
+  auto opC = op.getOpC();
+  auto opScaleD = op.getUseC();
+  auto typeA = opA.getType();
+  constexpr bool isSparse = std::is_same<OpT, ttn::SparseWGMMAOp>::value;
+
+  auto structTypeA = dyn_cast<LLVM::LLVMStructType>(typeA);
+
+  // TODO (zahi): is this the best way to tie inputs/outputs ?
+  if (opC)
+    operandsAndConstraints.push_back({opC, "0"});
+
+  if (structTypeA) {
+    operandsAndConstraints.push_back({opA, "r"});
+  } else {
+    operandsAndConstraints.push_back({opA, "l"});
+  }
+
+  // Operand B (must be `desc`)
+  operandsAndConstraints.push_back({opB, "l"});
+
+  if constexpr (isSparse) {
+    // Operand sp-meta
+    operandsAndConstraints.push_back({op.getAMeta(), "r"});
+  }
+
+  // `scale-d`
+  if (op.getOpC())
+    operandsAndConstraints.push_back({opScaleD, "b"});
+
+  return operandsAndConstraints;
+}
+
+template <typename OpT>
+static std::vector<std::string> getOutputConstraintsWGMMA(OpT op) {
+  // TODO (zahi): Return type must always be a struct for wgmma, currently
+  // we rely on the size of output constraints vector to determine whether
+  // the output is a struct or not. We should find a way to pass this info
+  auto resultType = op.getType();
+
+  auto outputStructType = dyn_cast<LLVM::LLVMStructType>(resultType);
+  uint32_t numOutputRegs = outputStructType.getBody().size();
+  std::string output =
+      outputStructType.getBody().front().isF32() ? "=f" : "=r";
+  return std::vector<std::string>(numOutputRegs, output);
+}
+
+template <typename OpT>
+static std::string getPtxAsmWGMMA(OpT op) {
+  using namespace ttn;
+  auto opA = op.getOpA();
+  auto opB = op.getOpB();
+  auto m = op.getM();
+  auto n = op.getN();
+  auto k = op.getK();
+  auto eltTypeC = op.getEltTypeC();
+  auto eltTypeA = op.getEltTypeA();
+  auto eltTypeB = op.getEltTypeB();
+  auto layoutA = op.getLayoutA();
+  auto layoutB = op.getLayoutB();
+
+  // Register checks
+  auto typeA = opA.getType();
+  auto typeB = opB.getType();
+  auto typeOutput = op.getType();
+  auto structTypeA = dyn_cast<LLVM::LLVMStructType>(typeA);
+  auto structTypeB = dyn_cast<LLVM::LLVMStructType>(typeB);
+  auto structTypeOutput = dyn_cast<LLVM::LLVMStructType>(typeOutput);
+  assert(!structTypeB && "Operand B can not be registers");
+  assert(structTypeOutput && "Output and C operand must be registers");
+
+  bool isSparse = std::is_same<OpT, ttn::SparseWGMMAOp>::value;
+
+  // SparseWGMMA has 2x the K value
+  auto kFactor = isSparse ? 2 : 1;
+
+  // Element type, MNK shape and transposing support check
+  // Reference:
+  // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#asynchronous-warpgroup-level-matrix-instructions-wgmma-mma
+  bool transA = layoutA == WGMMALayout::col;
+  bool transB = layoutB == WGMMALayout::row;
+  bool supported = false, needTransArgs = false, floatTypeWGMMA = false;
+  assert(m % 8 == 0 && n % 8 == 0 && k % 8 == 0);
+  // Below instructions do support transposing, must pass `trans` arguments
+  supported |=
+      (eltTypeA == WGMMAEltType::f16) && (eltTypeB == WGMMAEltType::f16) &&
+      (eltTypeC == WGMMAEltType::f16 || eltTypeC == WGMMAEltType::f32) &&
+      (m == 64 && 8 <= n && n <= 256 && k == 16 * kFactor);
+  supported |= (eltTypeA == WGMMAEltType::bf16) &&
+                (eltTypeB == WGMMAEltType::bf16) &&
+                (eltTypeC == WGMMAEltType::f32) &&
+                (m == 64 && 8 <= n && n <= 256 && k == 16 * kFactor);
+  needTransArgs = supported;
+  floatTypeWGMMA = supported;
+  // Below instructions do not support transposing
+  if (!supported && !transA && !transB) {
+    supported |= (eltTypeA == WGMMAEltType::tf32) &&
+                  (eltTypeB == WGMMAEltType::tf32) &&
+                  (eltTypeC == WGMMAEltType::f32) &&
+                  (!isSparse) &&
+                  (m == 64 && 8 <= n && n <= 256 && k == 8 * kFactor);
+    supported |=
+        (eltTypeA == WGMMAEltType::e4m3 || eltTypeA == WGMMAEltType::e5m2) &&
+        (eltTypeB == WGMMAEltType::e4m3 || eltTypeB == WGMMAEltType::e5m2) &&
+        (eltTypeC == WGMMAEltType::f16 || eltTypeC == WGMMAEltType::f32) &&
+        (m == 64 && 8 <= n && n <= 256 && k == 32 * kFactor);
+    floatTypeWGMMA = supported;
+    // Below instructions are integer-based
+    supported |= (eltTypeA == WGMMAEltType::s8) &&
+                  (eltTypeB == WGMMAEltType::s8) &&
+                  (eltTypeC == WGMMAEltType::s32) &&
+                  (!isSparse) &&
+                  (m == 64 && 8 <= n && n <= 224 && k == 32 * kFactor);
+  }
+  assert(supported && "WGMMA type or shape is not supported");
+
+  
+  // Operands
+  uint32_t asmOpIdx = 0;
+  std::string args = "";
+
+  // Output and operand C
+  uint32_t numCRegs = structTypeOutput.getBody().size();
+
+  args += "{";
+  for (uint32_t i = 0; i < numCRegs; ++i) {
+    args += "$" + std::to_string(asmOpIdx++) + (i == numCRegs - 1 ? "" : ",");
+  }
+  args += "}, ";
+
+  if (op.getOpC())
+    asmOpIdx += numCRegs;
+
+  // Operand A
+  if (structTypeA) {
+    uint32_t numARegs = structTypeA.getBody().size();
+    args += "{";
+    for (uint32_t i = 0; i < numARegs; ++i) {
+      args +=
+          "$" + std::to_string(asmOpIdx++) + (i == numARegs - 1 ? "" : ",");
+    }
+    args += "}, ";
+  } else {
+    args += "$" + std::to_string(asmOpIdx++) + ", ";
+  }
+
+  // Operand B (must be `desc`)
+  args += "$" + std::to_string(asmOpIdx++) + ", ";
+
+  if (isSparse) {
+    // Operand sp-meta
+    args += "$" + std::to_string(asmOpIdx++) + ", ";
+
+    // Operand sp-sel
+    args += "0, ";
+  }
+
+  // `scale-d`
+  if (op.getOpC())
+    args += "$" + std::to_string(asmOpIdx++);
+  else
+    args += "0";
+
+  // `imm-scale-a`, and `imm-scale-b` are 1 by default only for float-based
+  // WGMMA
+  if (floatTypeWGMMA)
+    args += ", 1, 1";
+
+  // Push `trans-a` and `trans-b` args if needed (determined as constant)
+  if (needTransArgs) {
+    if (!structTypeA)
+      args += ", " + std::to_string(transA);
+    args += ", " + std::to_string(transB);
+  }
+
+  std::string maybeSp = isSparse ? ".sp" : "";
+
+  auto ptxAsm = "wgmma.mma_async" + maybeSp + ".sync.aligned"
+                ".m" +
+                std::to_string(m) + "n" + std::to_string(n) + "k" +
+                std::to_string(k) + "." + stringifyEnum(eltTypeC).str() +
+                "." + stringifyEnum(eltTypeA).str() + "." +
+                stringifyEnum(eltTypeB).str() + " " + args + ";";
+  return ptxAsm;
+}
+
 class WGMMAOpPattern : public OpRewritePattern<ttn::WGMMAOp> {
 public:
   using OpRewritePattern<ttn::WGMMAOp>::OpRewritePattern;
 
   LogicalResult matchAndRewrite(ttn::WGMMAOp op,
                                 PatternRewriter &rewriter) const override {
-    return rewriteAsPtxAsm(op, rewriter, getPtxAsm(op),
-                           getOperandsAndConstraints(op),
-                           getOutputConstraints(op));
+    return rewriteAsPtxAsm(op, rewriter, getPtxAsmWGMMA(op),
+                           getOperandsAndConstraintsWGMMA(op),
+                           getOutputConstraintsWGMMA(op));
   }
+};
 
-  std::vector<std::string> getOutputConstraints(ttn::WGMMAOp op) const {
-    // TODO (zahi): Return type must always be a struct for wgmma, currently
-    // we rely on the size of output constraints vector to determine whether
-    // the output is a struct or not. We should find a way to pass this info
-    auto resultType = op.getType();
+class SparseWGMMAOpPattern : public OpRewritePattern<ttn::SparseWGMMAOp> {
+public:
+using OpRewritePattern<ttn::SparseWGMMAOp>::OpRewritePattern;
 
-    auto outputStructType = dyn_cast<LLVM::LLVMStructType>(resultType);
-    uint32_t numOutputRegs = outputStructType.getBody().size();
-    std::string output =
-        outputStructType.getBody().front().isF32() ? "=f" : "=r";
-    return std::vector<std::string>(numOutputRegs, output);
-  }
-
-  OperandsAndConstraints getOperandsAndConstraints(ttn::WGMMAOp op) const {
-    OperandsAndConstraints operandsAndConstraints;
-    auto opA = op.getOpA();
-    auto opB = op.getOpB();
-    auto opC = op.getOpC();
-    auto opScaleD = op.getUseC();
-    auto typeA = opA.getType();
-
-    auto structTypeA = dyn_cast<LLVM::LLVMStructType>(typeA);
-
-    // TODO (zahi): is this the best way to tie inputs/outputs ?
-    if (opC)
-      operandsAndConstraints.push_back({opC, "0"});
-
-    if (structTypeA) {
-      operandsAndConstraints.push_back({opA, "r"});
-    } else {
-      operandsAndConstraints.push_back({opA, "l"});
-    }
-
-    // Operand B (must be `desc`)
-    operandsAndConstraints.push_back({opB, "l"});
-
-    // `scale-d`
-    if (op.getOpC())
-      operandsAndConstraints.push_back({opScaleD, "b"});
-
-    return operandsAndConstraints;
-  }
-
-  std::string getPtxAsm(ttn::WGMMAOp op) const {
-    using namespace ttn;
-    auto opA = op.getOpA();
-    auto opB = op.getOpB();
-    auto m = op.getM();
-    auto n = op.getN();
-    auto k = op.getK();
-    auto eltTypeC = op.getEltTypeC();
-    auto eltTypeA = op.getEltTypeA();
-    auto eltTypeB = op.getEltTypeB();
-    auto layoutA = op.getLayoutA();
-    auto layoutB = op.getLayoutB();
-
-    // Register checks
-    auto typeA = opA.getType();
-    auto typeB = opB.getType();
-    auto typeOutput = op.getType();
-    auto structTypeA = dyn_cast<LLVM::LLVMStructType>(typeA);
-    auto structTypeB = dyn_cast<LLVM::LLVMStructType>(typeB);
-    auto structTypeOutput = dyn_cast<LLVM::LLVMStructType>(typeOutput);
-    assert(!structTypeB && "Operand B can not be registers");
-    assert(structTypeOutput && "Output and C operand must be registers");
-
-    // Element type, MNK shape and transposing support check
-    // Reference:
-    // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#asynchronous-warpgroup-level-matrix-instructions-wgmma-mma
-    bool transA = layoutA == WGMMALayout::col;
-    bool transB = layoutB == WGMMALayout::row;
-    bool supported = false, needTransArgs = false, floatTypeWGMMA = false;
-    assert(m % 8 == 0 && n % 8 == 0 && k % 8 == 0);
-    // Below instructions do support transposing, must pass `trans` arguments
-    supported |=
-        (eltTypeA == WGMMAEltType::f16) && (eltTypeB == WGMMAEltType::f16) &&
-        (eltTypeC == WGMMAEltType::f16 || eltTypeC == WGMMAEltType::f32) &&
-        (m == 64 && 8 <= n && n <= 256 && k == 16);
-    supported |= (eltTypeA == WGMMAEltType::bf16) &&
-                 (eltTypeB == WGMMAEltType::bf16) &&
-                 (eltTypeC == WGMMAEltType::f32) &&
-                 (m == 64 && 8 <= n && n <= 256 && k == 16);
-    needTransArgs = supported;
-    floatTypeWGMMA = supported;
-    // Below instructions do not support transposing
-    if (!supported && !transA && !transB) {
-      supported |= (eltTypeA == WGMMAEltType::tf32) &&
-                   (eltTypeB == WGMMAEltType::tf32) &&
-                   (eltTypeC == WGMMAEltType::f32) &&
-                   (m == 64 && 8 <= n && n <= 256 && k == 8);
-      supported |=
-          (eltTypeA == WGMMAEltType::e4m3 || eltTypeA == WGMMAEltType::e5m2) &&
-          (eltTypeB == WGMMAEltType::e4m3 || eltTypeB == WGMMAEltType::e5m2) &&
-          (eltTypeC == WGMMAEltType::f16 || eltTypeC == WGMMAEltType::f32) &&
-          (m == 64 && 8 <= n && n <= 256 && k == 32);
-      floatTypeWGMMA = supported;
-      // Below instructions are integer-based
-      supported |= (eltTypeA == WGMMAEltType::s8) &&
-                   (eltTypeB == WGMMAEltType::s8) &&
-                   (eltTypeC == WGMMAEltType::s32) &&
-                   (m == 64 && 8 <= n && n <= 224 && k == 32);
-    }
-    assert(supported && "WGMMA type or shape is not supported");
-
-    // Operands
-    uint32_t asmOpIdx = 0;
-    std::string args = "";
-
-    // Output and operand C
-    uint32_t numCRegs = structTypeOutput.getBody().size();
-
-    args += "{";
-    for (uint32_t i = 0; i < numCRegs; ++i) {
-      args += "$" + std::to_string(asmOpIdx++) + (i == numCRegs - 1 ? "" : ",");
-    }
-    args += "}, ";
-
-    if (op.getOpC())
-      asmOpIdx += numCRegs;
-
-    // Operand A
-    if (structTypeA) {
-      uint32_t numARegs = structTypeA.getBody().size();
-      args += "{";
-      for (uint32_t i = 0; i < numARegs; ++i) {
-        args +=
-            "$" + std::to_string(asmOpIdx++) + (i == numARegs - 1 ? "" : ",");
-      }
-      args += "}, ";
-    } else {
-      args += "$" + std::to_string(asmOpIdx++) + ", ";
-    }
-
-    // Operand B (must be `desc`)
-    args += "$" + std::to_string(asmOpIdx++) + ", ";
-
-    // `scale-d`
-    if (op.getOpC())
-      args += "$" + std::to_string(asmOpIdx++);
-    else
-      args += "0";
-
-    // `imm-scale-a`, and `imm-scale-b` are 1 by default only for float-based
-    // WGMMA
-    if (floatTypeWGMMA)
-      args += ", 1, 1";
-
-    // Push `trans-a` and `trans-b` args if needed (determined as constant)
-    if (needTransArgs) {
-      if (!structTypeA)
-        args += ", " + std::to_string(transA);
-      args += ", " + std::to_string(transB);
-    }
-
-    auto ptxAsm = "wgmma.mma_async.sync.aligned"
-                  ".m" +
-                  std::to_string(m) + "n" + std::to_string(n) + "k" +
-                  std::to_string(k) + "." + stringifyEnum(eltTypeC).str() +
-                  "." + stringifyEnum(eltTypeA).str() + "." +
-                  stringifyEnum(eltTypeB).str() + " " + args + ";";
-    return ptxAsm;
+  LogicalResult matchAndRewrite(ttn::SparseWGMMAOp op,
+                                PatternRewriter &rewriter) const override {
+    return rewriteAsPtxAsm(op, rewriter, getPtxAsmWGMMA(op),
+                           getOperandsAndConstraintsWGMMA(op),
+                           getOutputConstraintsWGMMA(op));
   }
 };
 
@@ -788,7 +827,7 @@ public:
 
     patterns
         .add<FenceAsyncSharedOpPattern, LoadMatrixOpPattern,
-             StoreMatrixOpPattern, ClusterArriveOpPattern, WGMMAOpPattern,
+             StoreMatrixOpPattern, ClusterArriveOpPattern, WGMMAOpPattern, SparseWGMMAOpPattern,
              LoadAcquireOpPattern, WGMMAWaitGroupOpPattern, WarpIdOpPattern>(
             context);
 

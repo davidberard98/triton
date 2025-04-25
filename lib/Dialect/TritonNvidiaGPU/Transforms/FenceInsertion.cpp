@@ -40,7 +40,7 @@ public:
       return;
     ModuleOp mod = getOperation();
     mod.walk([&](Operation *op) {
-      bool isMMAv3 = isa<ttng::WarpGroupDotOp>(op);
+      bool isMMAv3 = isa<ttng::WarpGroupDotOp, ttng::SparseWarpGroupDotOp>(op);
       if (!isMMAv3 && !isa<ttng::MMAv5OpInterface>(op))
         return WalkResult::advance();
       OpBuilder builder(op);
@@ -77,10 +77,19 @@ private:
   bool dependOnSharedEncOperand(Value operand) {
     static DenseSet<std::pair<Operation *, unsigned>> trace;
     auto op = operand.getDefiningOp();
+    // TODO(sparsity) remove debug
+    llvm::outs() << " dependonSharedEncOperand: " << operand << "\n";
+    llvm::outs().flush();
     // avoid redundant insertion
     if (op && isa<mlir::triton::DotOpInterface>(op))
       return false;
     // reach convertlayout
+    if (op && isa<ttg::LocalAllocOp>(op)) {
+      llvm::outs() <<"   LOCAL ALLOC!!\n";
+      llvm::outs() << *op->getParentOp() << "\n";
+      llvm::outs().flush();
+      int x = 5;
+    }
     if (op && isa<ttg::LocalAllocOp>(op) &&
         cast<ttg::LocalAllocOp>(op).getSrc())
       return true;

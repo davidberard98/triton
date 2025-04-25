@@ -664,6 +664,16 @@ SmallVector<unsigned> AMDRotatingSharedEncodingAttr::getCTASplitNum() const {
   return SmallVector<unsigned>(getCTALayout().getCTASplitNum());
 }
 
+static SmallVector<unsigned> getCTASplitNumForDotOperand(const ArrayRef<unsigned>& parentCTASplitNum, unsigned opIdx) {
+  SmallVector<unsigned> res(parentCTASplitNum);
+  auto rank = res.size();
+  assert(rank == 2 || rank == 3 && "Invalid dotLayout");
+
+  auto kDim = opIdx == 0 ? rank - 1 : rank - 2;
+  res[kDim] = 1;
+  return res;
+}
+
 SmallVector<unsigned> DotOperandEncodingAttr::getCTAsPerCGA() const {
   return ::getCTAsPerCGA(getParent());
 }
@@ -671,14 +681,7 @@ SmallVector<unsigned> DotOperandEncodingAttr::getCTAOrder() const {
   return ::getCTAOrder(getParent());
 }
 SmallVector<unsigned> DotOperandEncodingAttr::getCTASplitNum() const {
-  SmallVector<unsigned> res = ::getCTASplitNum(getParent());
-  auto rank = res.size();
-  assert(rank == 2 || rank == 3 && "Invalid dotLayout");
-
-  // Do not split CTA in K dimension
-  auto kDim = getOpIdx() == 0 ? rank - 1 : rank - 2;
-  res[kDim] = 1;
-  return res;
+  return getCTASplitNumForDotOperand(::getCTASplitNum(getParent()), getOpIdx());
 }
 
 LogicalResult DotOperandEncodingAttr::verify(
@@ -730,6 +733,23 @@ LogicalResult DotOperandEncodingAttr::verify(
 
   return emitError() << "ttg.dot_op unexpected parent layout: " << parent;
 }
+
+SmallVector<unsigned> NvidiaSparseMetaEncodingAttr::getRepOrder() const {
+  auto parent = mlir::dyn_cast<MmaEncodingTrait>(getParent());
+  assert(parent && "getRepOrder is defined on NvidiaSparseMetaEncodingAttr only "
+                   "when its parent is a MmaEncodingTrait");
+  return parent.getRepOrderForOperand(0);
+}
+SmallVector<unsigned> NvidiaSparseMetaEncodingAttr::getCTAsPerCGA() const {
+  return ::getCTAsPerCGA(getParent());
+}
+SmallVector<unsigned> NvidiaSparseMetaEncodingAttr::getCTAOrder() const {
+  return ::getCTAOrder(getParent());
+}
+SmallVector<unsigned> NvidiaSparseMetaEncodingAttr::getCTASplitNum() const {
+  return getCTASplitNumForDotOperand(::getCTASplitNum(getParent()), /*opIdx*/0);
+}
+
 
 //===----------------------------------------------------------------------===//
 // Blocked Encoding

@@ -467,6 +467,13 @@ private:
     if (rhs.getConstantValue().has_value() &&
         rhs.getConstantValue().value() == 1)
       return lhs.getDivisibility(dim);
+
+    // Case 3: rhs is a power of 2 constant
+    if (auto rhsVal = rhs.getConstantValue().has_value()) {
+      if (rhsVal > 0 && llvm::isPowerOf2_64(rhsVal)) {
+        return std::max<int64_t>(1, lhs.getDivisibility(dim) / rhsVal);
+      }
+    }
     // otherwise: return 1
     return 1;
   }

@@ -1366,7 +1366,7 @@ vecIdx (index of the element in the quad; this is always along the k-dim)
 def NvidiaSparseMetaEncoding : DistributedEncoding<"NvidiaSparseMetaEncoding", "nvidia_sparse_meta_encoding"> {
   let mnemonic = "nvidia_sparse_meta";
 
-  let parameters = (ins "DistributedEncodingTrait":$parent);
+  let parameters = (ins "DistributedEncodingTrait":$parent, "unsigned":$bitwidth);
   let assemblyFormat = "`<``{` struct(params) `}``>`";
   let extraClassDeclaration = extraDistributedDeclaration;
 }

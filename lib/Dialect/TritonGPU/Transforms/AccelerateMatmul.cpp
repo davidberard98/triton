@@ -450,9 +450,13 @@ Value getSparseDotOpNewAMeta(triton::SparseDotOp sparseDotOp,
     llvm::outs().flush();
   }
 
+  auto aBitwidth = sparseDotOp.getA().getType().getElementType().getIntOrFloatBitWidth();
+  auto bBitwidth = sparseDotOp.getB().getType().getElementType().getIntOrFloatBitWidth();
+  assert (aBitwidth == bBitwidth && "a and b must have the same bitwidth");
+
   auto metaEncoding = NvidiaSparseMetaEncodingAttr::get(
       sparseDotOp->getContext(),
-      cast<triton::gpu::NvidiaMmaEncodingAttr>(newRetType.getEncoding()));
+      cast<triton::gpu::NvidiaMmaEncodingAttr>(newRetType.getEncoding()), aBitwidth);
   metaType = RankedTensorType::get(metaType.getShape(),
                                    metaType.getElementType(), metaEncoding);
   meta = rewriter.create<ConvertLayoutOp>(meta.getLoc(), metaType, meta);

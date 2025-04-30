@@ -1884,11 +1884,11 @@ def dot_scaled(lhs, lhs_scale, lhs_format, rhs, rhs_scale, rhs_format, acc=None,
 
 
 @builtin
-def sparse_dot(input, other, acc, input_meta, _builder=None):
+def sparse_dot(input, other, acc, input_meta, input_precision=None, max_num_imprecise_acc=None, _builder=None):
     """
     TODO
     """
-    return semantic.sparse_dot(input, other, acc, input_meta, _builder)
+    return semantic.sparse_dot(input, other, acc, input_meta, input_precision, max_num_imprecise_acc, _builder)
 
 
 @builtin

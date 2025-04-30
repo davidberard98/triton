@@ -1566,10 +1566,10 @@ def _str_to_fp_type(float_format: str):
     return ty_enum
 
 
-def sparse_dot(lhs: tl.tensor, rhs: tl.tensor, acc: tl.tensor, lhs_meta: tl.tensor, builder: ir.builder) -> tl.tensor:
+def sparse_dot(lhs: tl.tensor, rhs: tl.tensor, acc: tl.tensor, lhs_meta: tl.tensor, input_precision: Optional[str], max_num_imprecise_acc: Optional[int], builder: ir.builder) -> tl.tensor:
     assert lhs.type.is_block() and rhs.type.is_block()
-    assert lhs.dtype in (tl.float16, tl.bfloat16), f"Unsupported lhs dtype {lhs.dtype}"
-    assert rhs.dtype in (tl.float16, tl.bfloat16), f"Unsupported rhs dtype {rhs.dtype}"
+    assert lhs.dtype in (tl.float16, tl.bfloat16, tl.float8e4nv), f"Unsupported lhs dtype {lhs.dtype}"
+    assert rhs.dtype in (tl.float16, tl.bfloat16, tl.float8e4nv), f"Unsupported rhs dtype {rhs.dtype}"
     assert lhs.dtype == rhs.dtype, f"Both operands must be same dtype. Got {lhs.dtype} and {rhs.dtype}"
 
     lhs_rank = len(lhs.shape)
@@ -1596,7 +1596,19 @@ def sparse_dot(lhs: tl.tensor, rhs: tl.tensor, acc: tl.tensor, lhs_meta: tl.tens
         acc_handle = acc.handle
         assert acc.type == ret_ty
 
-    return tl.tensor(builder.create_sparse_dot(lhs.handle, rhs.handle, acc_handle, lhs_meta.handle), ret_ty)
+    if input_precision is None:
+        input_precision = builder.options.default_dot_input_precision
+
+    input_precision = _str_to_dot_input_precision(input_precision, builder)
+
+    # max_num_imprecise_acc only applies to fp8 -> fp32 dot on sm_90
+    if max_num_imprecise_acc is None:
+        if lhs.dtype.is_fp8() and rhs.dtype.is_fp8():
+            max_num_imprecise_acc = builder.options.max_num_imprecise_acc_default
+        else:
+            max_num_imprecise_acc = 0
+
+    return tl.tensor(builder.create_sparse_dot(lhs.handle, rhs.handle, acc_handle, lhs_meta.handle, input_precision, max_num_imprecise_acc), ret_ty)
 
 
 def _bitcast_to_fp_type(val: tl.tensor, float_format: str, builder: ir.builder):

@@ -1622,7 +1622,14 @@ NvidiaSparseMetaEncodingAttr::toLinearLayout(ArrayRef<int64_t> shape) const {
   std::vector<std::vector<int32_t>> warpBasis;
 
   // TODO(sparsity) check on Ampere.
-  SmallVector<int32_t> shapePerWarp = {16, 2};
+  SmallVector<int32_t> shapePerWarp = [&]() -> SmallVector<int32_t> {
+    if (getBitwidth() == 16)
+      return {16, 2};
+    else {
+      assert (getBitwidth() == 8 && "only 8-bit or 16-bit formats are supported");
+      return {16, 4};
+    }
+  }();
 
   /*
   if (mmaEnc.isAmpere()) {
@@ -1654,11 +1661,20 @@ NvidiaSparseMetaEncodingAttr::toLinearLayout(ArrayRef<int64_t> shape) const {
   // In other linear layouts, we outDimNames[order[0]], outDimNames[order[1]].
   // But if we do that (and assuming that order is [1, 0]), then we'd need to
   // transpose all the basis values in the definition below.
-  auto layoutPerCTA =
-      LinearLayout({{kRegister, {{8, 0}}},
-                    {kLane, {{0, 1}, {0, 0}, {1, 0}, {2, 0}, {4, 0}}},
-                    {kWarp, warpBasis}},
-                   {outDimNames[0], outDimNames[1]});
+  auto layoutPerCTA = [&]() {
+    if (getBitwidth() == 16) {
+      return LinearLayout({{kRegister, {{8, 0}}},
+                           {kLane, {{0, 1}, {0, 0}, {1, 0}, {2, 0}, {4, 0}}},
+                           {kWarp, warpBasis}},
+                          {outDimNames[0], outDimNames[1]});
+    } else {
+      assert(getBitwidth() == 8 && "only 8-bit or 16-bit formats are supported");
+      return LinearLayout({{kRegister, {{0, 1}}},
+                           {kLane, {{8, 0}, {0, 2}, {1, 0}, {2, 0}, {4, 0}}},
+                           {kWarp, warpBasis}},
+                          {outDimNames[0], outDimNames[1]});
+    }
+  }();
 
   auto ctaLayout = getCTALayout(getParent());
 

@@ -1627,8 +1627,10 @@ void init_triton_ir(py::module &&m) {
            })
       .def("create_sparse_dot",
            [](TritonOpBuilder &self, mlir::Value &a, mlir::Value &b,
-              mlir::Value &c, mlir::Value &aMeta) -> mlir::Value {
-             return self.create<SparseDotOp>(c.getType(), a, b, c, aMeta);
+              mlir::Value &c, mlir::Value &aMeta, InputPrecision inputPrecision,
+              int maxNumImpreciseAcc) -> mlir::Value {
+             return self.create<SparseDotOp>(c.getType(), a, b, c, aMeta,
+                                             inputPrecision, maxNumImpreciseAcc);
            })
       .def("create_floor",
            [](TritonOpBuilder &self, Value &val) -> Value {

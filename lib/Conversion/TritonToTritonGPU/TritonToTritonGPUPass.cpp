@@ -333,9 +333,12 @@ LogicalResult TritonGenericDotPattern<triton::SparseDotOp>::matchAndRewrite(
     return failure();
   Value aMeta = adaptor.getAMeta();
   if (!isa<triton::gpu::NvidiaSparseMetaEncodingAttr>(aMetaEncoding)) {
+    unsigned aBitwidth = op.getA().getType().getElementType().getIntOrFloatBitWidth();
+    unsigned bBitwidth = op.getB().getType().getElementType().getIntOrFloatBitWidth();
+    assert (aBitwidth == bBitwidth && "a and b must have the same bitwidth");
     Attribute encoding = NvidiaSparseMetaEncodingAttr::get(
         getContext(), cast<triton::gpu::DistributedEncodingTrait>(
-                          args->retType.getEncoding()));
+                          args->retType.getEncoding()), aBitwidth);
     auto tensorType = RankedTensorType::get(
         aMetaType.getShape(), aMetaType.getElementType(), encoding);
     aMeta = rewriter.create<triton::gpu::ConvertLayoutOp>(aMeta.getLoc(),

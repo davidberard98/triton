@@ -372,15 +372,15 @@ if torch.allclose(triton_output, torch_output, atol=1e-2, rtol=rtol):
 else:
     print("❌ Triton and Torch differ")
 
-TORCH_HAS_FP8 = hasattr(torch, "float8_e5m2")
+TORCH_HAS_FP8 = hasattr(torch, "float8_e4m3fn")
 if TORCH_HAS_FP8 and is_cuda():
     torch.manual_seed(0)
     a = torch.randn((512, 512), device=DEVICE, dtype=torch.float16)
     b = torch.randn((512, 512), device=DEVICE, dtype=torch.float16)
-    a = a.to(torch.float8_e5m2)
+    a = a.to(torch.float8_e4m3fn)
     # pre-transpose b for efficiency.
     b = b.T
-    b = b.to(torch.float8_e5m2)
+    b = b.to(torch.float8_e4m3fn)
     triton_output = matmul(a, b)
     torch_output = torch.matmul(a.to(torch.float16), b.to(torch.float16))
     print(f"triton_output_with_fp8_inputs={triton_output}")
@@ -413,8 +413,10 @@ for fp8_inputs in [False, True]:
             line_arg="provider",  # Argument name whose value corresponds to a different line in the plot
             # Possible values for `line_arg`
             # Don't compare to cublas for fp8 cases as torch.matmul doesn't support fp8 at the moment.
-            line_vals=["triton"] if fp8_inputs else [ref_lib.lower(), "triton"],  # Label name for the lines
-            line_names=["Triton"] if fp8_inputs else [ref_lib, "Triton"],  # Line styles
+            # line_vals=["triton"] if fp8_inputs else [ref_lib.lower(), "triton"],  # Label name for the lines
+            # line_names=["Triton"] if fp8_inputs else [ref_lib, "Triton"],  # Line styles
+            line_vals=[ref_lib.lower(), "triton"],  # Label name for the lines
+            line_names=[ref_lib, "Triton"],  # Line styles
             styles=[("green", "-"), ("blue", "-")],
             ylabel="TFLOPS",  # Label name for the y-axis
             plot_name="matmul-performance-" +
@@ -428,12 +430,17 @@ def benchmark(M, N, K, provider, fp8_inputs):
     a = torch.randn((M, K), device=DEVICE, dtype=torch.float16)
     b = torch.randn((K, N), device=DEVICE, dtype=torch.float16)
     if TORCH_HAS_FP8 and fp8_inputs:
-        a = a.to(torch.float8_e5m2)
+        a = a.to(torch.float8_e4m3fn)
         b = b.T
-        b = b.to(torch.float8_e5m2)
+        b = b.to(torch.float8_e4m3fn)
     quantiles = [0.5, 0.2, 0.8]
     if provider == ref_lib.lower():
-        ms, min_ms, max_ms = triton.testing.do_bench(lambda: torch.matmul(a, b), quantiles=quantiles)
+        if fp8_inputs:
+            one_device = torch.tensor(1., device=a.device, dtype=torch.float32)
+            fn = lambda: torch._scaled_mm(a, b, scale_a=one_device, scale_b=one_device, out_dtype=torch.float16, use_fast_accum=True)
+        else:
+            fn = lambda: torch.matmul(a, b)
+        ms, min_ms, max_ms = triton.testing.do_bench(fn, quantiles=quantiles)
     if provider == 'triton':
         ms, min_ms, max_ms = triton.testing.do_bench(lambda: matmul(a, b), quantiles=quantiles)
     perf = lambda ms: 2 * M * N * K * 1e-12 / (ms * 1e-3)

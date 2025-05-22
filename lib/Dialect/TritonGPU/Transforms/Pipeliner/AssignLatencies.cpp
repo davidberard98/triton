@@ -160,6 +160,7 @@ private:
         if (enc != localAllocEnc) {
           // If the load is used by a LocalAllocOp, all the users need to have
           // the same encoding.
+          LDBG("Load " << *op << " has multiple users with different encodings??");
           return false;
         }
       }
@@ -169,6 +170,7 @@ private:
       auto registerTy = cast<RankedTensorType>(op->getResultTypes()[0]);
       auto vecBytes = getCopyVecBytes(registerTy, localAllocEnc);
       if (vecBytes < 4) {
+        LDBG("Load " << *op << " has vecBytes " << vecBytes << " from " << localAllocEnc);
         // At least 4 bytes need to be consecutive for cp.async
         return false;
       }

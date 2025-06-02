@@ -295,6 +295,20 @@ def benchmark_triton(aSparse, aMeta, b, out_dtype):
     print(f"  Triton Perf: {flops} TFLOPS")
 
 
+def benchmark_torch_dense(a, b, out_dtype):
+    if a.dtype.itemsize == 1:
+        one_device = torch.tensor(1., device=a.device)
+        def bench_fn():
+            return torch._scaled_mm(a, b, scale_a=one_device, scale_b=one_device, out_dtype=out_dtype, use_fast_accum=True)
+    else:
+        def bench_fn():
+            return torch.matmul(a, b)
+
+    ms = do_bench_repeat(bench_fn)
+    flops = calc_flops(test_dim, ms)
+    print(f"  torch.matmul/torch._scaled_mm Perf: {flops} TFLOPS")
+
+
 def benchmark_cusparselt(a, b):
     cusparse_A = torch._cslt_compress(a)
     cusparse_B = b
@@ -317,6 +331,7 @@ def test_inputs(a, aSparse, aMeta, b, out_dtype, tolerance):
     check_accuracy(a, aSparse, aMeta, b, out_dtype, tolerance)
     benchmark_triton(aSparse, aMeta, b, out_dtype)
     benchmark_cusparselt(a, b)
+    benchmark_torch_dense(a, b, out_dtype)
 
 
 test_dim = 8192

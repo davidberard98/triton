@@ -35,11 +35,13 @@ namespace {
 LinearLayout getRegToSharedLayout(MLIRContext *ctx, ArrayRef<int64_t> shape,
                                   LinearLayout regLayout,
                                   triton::gpu::SharedEncodingTrait dstEnc,
-                                  int elemBitWidth) {
+                                  int elemBitWidth,
+                                  ArrayRef<int64_t> allocShape) {
   StringAttr kBlock = StringAttr::get(ctx, ("block"));
   int rank = shape.size();
 
-  LinearLayout sharedLayout = triton::gpu::toLinearLayout(shape, dstEnc);
+  LinearLayout sharedLayout =
+      triton::gpu::toLinearLayout(shape, dstEnc, allocShape);
   auto sharedOrder = triton::gpu::getOrder(dstEnc, shape);
 
   // sharedLayout's in-dims are currently (offset, block).  Reshape to
@@ -227,7 +229,7 @@ emitIndices(Location loc, RewriterBase &rewriter, const TargetInfoBase &target,
   MLIRContext *ctx = rewriter.getContext();
   auto shape = type.getShape();
 
-  LinearLayout ll = triton::gpu::toLinearLayout(shape, layout);
+  LinearLayout ll = triton::gpu::toLinearLayout(shape, layout, {});
 
   // TODO(jlebar): We could add strong typing if we wanted; for now this is
   // "stringly typed".
@@ -346,7 +348,7 @@ Value getSmemVecAddr(const LinearLayout &regLayout,
                 sharedEnc)) {
       auto regToSharedLayout =
           getRegToSharedLayout(ctx, shape, regLayout, swizzledSharedEnc,
-                               elemLlvmTy.getIntOrFloatBitWidth());
+                               elemLlvmTy.getIntOrFloatBitWidth(), allocShape);
       auto smemOrder = swizzledSharedEnc.getOrder();
       smemOffsets = llvm::to_vector(llvm::drop_end(llvm::make_second_range(
           applyLinearLayout(loc, rewriter, regToSharedLayout,
@@ -481,10 +483,16 @@ bool emitTransferBetweenRegistersAndShared(
   // take out the "block" dimension.
   // Thus we use `pseudoinvert` instead of `invert` here for simplicity.
   auto allocShape = sharedTy.getAllocShape();
-  LinearLayout invertAllocSharedLayout =
-      triton::gpu::toLinearLayout(allocShape.take_back(sharedTy.getRank()),
-                                  sharedTy.getEncoding())
-          .pseudoinvert();
+  auto invertAllocSharedLayout = LinearLayout::empty();
+  if (!paddedLayout) {
+    // This is the legacy way of doing things that's much more ad-hoc
+    // For generic shared layouts it may or may not be correct
+    auto allocShape = sharedTy.getAllocShape();
+    auto trimShape = allocShape.take_back(sharedTy.getRank());
+    invertAllocSharedLayout = triton::gpu::toLinearLayout(
+                                  trimShape, sharedTy.getEncoding(), trimShape)
+                                  .pseudoinvert();
+  }
 
   int numElems = regToSharedLayout.getInDimSize(kRegister);
   auto vecTy = vec_ty(elemLlvmTy, vecElems);
@@ -1094,7 +1102,7 @@ delinearize(RewriterBase &rewriter, Location loc,
             triton::gpu::DistributedEncodingTrait layout,
             ArrayRef<int64_t> shape, StringAttr dimName, Value linear) {
   auto b = TritonLLVMOpBuilder(loc, rewriter);
-  auto ll = triton::gpu::toLinearLayout(shape, layout);
+  auto ll = triton::gpu::toLinearLayout(shape, layout, {});
   auto linearLayout =
       triton::gpu::LinearEncodingAttr::get(rewriter.getContext(), ll);
   assert(ll.hasInDim(dimName));

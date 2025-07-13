@@ -37,11 +37,14 @@ namespace gpu {
 
 LinearEncodingAttr TritonGPUDialect::toLinearEncoding(ArrayRef<int64_t> shape,
                                                       Attribute layout) {
-  CacheKey key{std::vector<int64_t>(shape.begin(), shape.end()), layout};
+  // LinearEncoding is a DistributedLayout
+  std::vector<int64_t> allocationShape;
+  CacheKey key{std::vector<int64_t>(shape.begin(), shape.end()), layout,
+               allocationShape};
   if (auto result = leCache.get(key)) {
     return *result;
   }
-  auto linearLayout = toLinearLayout(shape, layout);
+  auto linearLayout = toLinearLayout(shape, layout, {});
   auto linearEncoding =
       LinearEncodingAttr::get(layout.getContext(), std::move(linearLayout));
   leCache.set(key, linearEncoding);
@@ -2125,7 +2128,7 @@ struct TritonGPUInferLayoutInterface
       return success();
     }
 
-    auto ll = toLinearLayout(shape, operandEncoding);
+    auto ll = toLinearLayout(shape, operandEncoding, {});
     auto transposedLl = transposeLinearLayout(ll, order);
     resultEncoding = LinearEncodingAttr::get(ctx, std::move(transposedLl));
     return success();
@@ -2516,7 +2519,7 @@ struct TritonGPUInferLayoutInterface
     auto ctx = getContext();
 
     // Append dim to shape
-    auto ll = toLinearLayout(shape, srcEnc);
+    auto ll = toLinearLayout(shape, srcEnc, {});
     SmallVector<int64_t> dstShape(shape.begin(), shape.end());
     dstShape.push_back(1);
     ll = ll.reshapeOuts(standardOutDimPairs(ctx, dstShape));
@@ -2584,7 +2587,7 @@ struct TritonGPUInferLayoutInterface
     auto ctx = getContext();
 
     // Split on last dim
-    auto ll = toLinearLayout(shape, srcEnc);
+    auto ll = toLinearLayout(shape, srcEnc, {});
     auto newLl = LinearLayout::empty();
     auto result =
         tryJoinOnAxis(ctx, ll, newLl, /*fwdInference=*/false, axis, loc);
@@ -2654,7 +2657,7 @@ struct TritonGPUInferLayoutInterface
       }
     }
 
-    auto ll = toLinearLayout(shape, inEnc);
+    auto ll = toLinearLayout(shape, inEnc, {});
     auto newLl = LinearLayout::empty();
     auto result = tryJoinOnAxis(ctx, ll, newLl, fwdInference, axis, loc);
     if (!result.succeeded())
@@ -2766,7 +2769,8 @@ std::string getSharedLayoutStr(RankedTensorType tensorType,
   if (!layout)
     return "";
 
-  LinearLayout ll = triton::gpu::toLinearLayout(tensorType.getShape(), layout);
+  auto shape = tensorType.getShape();
+  LinearLayout ll = triton::gpu::toLinearLayout(shape, layout, shape);
 
   StringAttr kOffset = StringAttr::get(tensorType.getContext(), "offset");
   StringAttr kBlock = StringAttr::get(tensorType.getContext(), "block");
@@ -3183,8 +3187,8 @@ int triton::gpu::lookupThreadsPerWarp(OpBuilder &rewriter) {
 
 bool triton::gpu::areLayoutsEquivalent(ArrayRef<int64_t> shape, Attribute lhs,
                                        Attribute rhs) {
-  auto lhsLL = triton::gpu::toLinearLayout(shape, lhs);
-  auto rhsLL = triton::gpu::toLinearLayout(shape, rhs);
+  auto lhsLL = triton::gpu::toLinearLayout(shape, lhs, {});
+  auto rhsLL = triton::gpu::toLinearLayout(shape, rhs, {});
   return lhsLL == rhsLL;
 }
 

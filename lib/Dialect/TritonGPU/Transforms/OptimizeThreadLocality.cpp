@@ -13,6 +13,10 @@
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 
+#define DEBUG_TYPE "tritongpu-optimize-thread-locality"
+#define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
+#define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
+
 namespace mlir {
 namespace triton {
 namespace gpu {
@@ -237,6 +241,155 @@ struct OptimizeGatherLayoutPattern : public mlir::OpRewritePattern<GatherOp> {
 } // namespace
 
 namespace {
+struct OptimizeReductionWarpLayoutPattern : public OpRewritePattern<LoadOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(LoadOp op,
+                                PatternRewriter &rewriter) const override {
+    // First check whether all recursive users of LoadOp are ReduceOps.
+    auto [hasOnlyReductionLeaves, reductionUsers] = onlyReductionUsers(op);
+    if (!hasOnlyReductionLeaves) {
+      LDBG("Not only reduction leaves. Skipping");
+      return failure();
+    }
+    if (reductionUsers.size() == 0) {
+      LDBG("There are no reductions downstream of this load. Skipping");
+    }
+    std::optional<int> reductionAxis;
+    for (auto &redOp : reductionUsers) {
+      auto newAxis = cast<ReduceOp>(redOp).getAxis();
+      if (reductionAxis.has_value() && *reductionAxis != newAxis) {
+        LDBG("Other reduction ops reduce along "
+             << *reductionAxis << " but this op reduces along " << newAxis
+             << ". Skipping. " << *redOp);
+        return failure();
+      }
+      reductionAxis = newAxis;
+    }
+    // Get operand encoding for each operand of LoadOp
+    std::optional<BlockedEncodingAttr> operandEncodings;
+    std::optional<SmallVector<int64_t>> shape;
+    for (Value operand : op.getOperands()) {
+      if (auto tensorType = dyn_cast<RankedTensorType>(operand.getType())) {
+        if (!isa<triton::gpu::BlockedEncodingAttr>(tensorType.getEncoding())) {
+          LDBG("Operand " << operand
+                          << " does not have a blocked encoding. Skipping");
+          return failure();
+        }
+        if (!shape) {
+          shape = SmallVector<int64_t>(tensorType.getShape());
+        }
+        assert(*shape == tensorType.getShape());
+        auto thisEncoding =
+            cast<triton::gpu::BlockedEncodingAttr>(tensorType.getEncoding());
+        if (!operandEncodings) {
+          operandEncodings = thisEncoding;
+        }
+        assert(thisEncoding == *operandEncodings);
+      }
+    }
+
+    LDBG("BlockedEncoding: " << *operandEncodings);
+
+    auto originalEncoding = *operandEncodings;
+    if (originalEncoding.getWarpsPerCTA()[*reductionAxis] == 1) {
+      LDBG("Reduction axis is already along only one warp. Skipping");
+      return failure();
+    }
+
+    auto order = SmallVector<unsigned>(originalEncoding.getOrder());
+    for (int d = 0; d < order.size(); ++d) {
+      if (order[d] == *reductionAxis) {
+        std::swap(order[d], order[order.size() - 1]);
+        break;
+      }
+    }
+    assert(order[order.size() - 1] == *reductionAxis);
+
+    auto remainingWarps = product<unsigned>(originalEncoding.getWarpsPerCTA());
+    SmallVector<unsigned> warpsPerCTA(order.size(), 1);
+    for (int d = 0; d < order.size(); ++d) {
+      int i = order[d];
+      int warpsAlongDim = std::clamp<unsigned>(
+          (*shape)[i] / originalEncoding.getSizePerThread()[i] /
+              originalEncoding.getThreadsPerWarp()[i],
+          1, remainingWarps);
+      warpsPerCTA[i] = warpsAlongDim;
+      remainingWarps /= warpsAlongDim;
+    }
+    warpsPerCTA[warpsPerCTA.size() - 1] *= remainingWarps;
+    if (warpsPerCTA[warpsPerCTA.size() - 1] != 1) {
+      LDBG("Could not find a warp layout that reduces along the reduction "
+           "axis. Skipping");
+      return failure();
+    }
+
+    auto newEncoding = triton::gpu::BlockedEncodingAttr::get(
+        getContext(), originalEncoding.getSizePerThread(),
+        originalEncoding.getThreadsPerWarp(), warpsPerCTA,
+        originalEncoding.getOrder(), originalEncoding.getCTALayout());
+
+    LDBG("New encoding: " << newEncoding);
+
+    auto ret = doConversions(op, rewriter, newEncoding);
+
+    return ret;
+  }
+
+  std::pair<bool, SetVector<Operation *>>
+  onlyReductionUsers(Operation *op) const {
+    SetVector<Operation *> users;
+    mlir::ForwardSliceOptions options;
+    SetVector<Operation *> reductionUsers;
+    bool hasNonReductionLeaves = false;
+    options.filter = [&](Operation *user) {
+      bool canContinue = user->hasTrait<mlir::OpTrait::Elementwise>() ||
+                         isa<LoadOp, StoreOp>(user);
+      if (isa<ReduceOp>(user)) {
+        reductionUsers.insert(user);
+      }
+      if (!canContinue && !isa<ReduceOp>(user)) {
+        hasNonReductionLeaves = true;
+      }
+      return canContinue;
+    };
+    mlir::getForwardSlice(op, &users, options);
+    return {!hasNonReductionLeaves, reductionUsers};
+  }
+
+  LogicalResult doConversions(LoadOp op, PatternRewriter &rewriter,
+                              BlockedEncodingAttr newEncoding) const {
+
+    SmallVector<Value, 4> newArgs;
+    for (Value operand : op.getOperands()) {
+      if (auto tensorType = dyn_cast<RankedTensorType>(operand.getType())) {
+        auto cvt = rewriter.create<ConvertLayoutOp>(
+            op.getLoc(), tensorType.cloneWithEncoding(newEncoding), operand);
+        newArgs.push_back(cvt);
+      } else {
+        newArgs.push_back(operand);
+      }
+    }
+
+    SmallVector<Type> newTypes;
+    for (Type type : op->getResultTypes()) {
+      auto tensorType = cast<RankedTensorType>(type);
+      newTypes.push_back(tensorType.cloneWithEncoding(newEncoding));
+    }
+
+    Operation *newOp =
+        rewriter.create(op->getLoc(), op->getName().getIdentifier(), newArgs,
+                        newTypes, op->getAttrs());
+    LDBG(" old Op: " << *op);
+    LDBG(" new Op: " << *newOp);
+    auto resultCvt = rewriter.create<ConvertLayoutOp>(op.getLoc(), op.getType(),
+                                                      newOp->getResult(0));
+
+    rewriter.replaceOp(op, resultCvt);
+    return success();
+  }
+};
+
 class TritonGPUOptimizeThreadLocalityPass
     : public impl::TritonGPUOptimizeThreadLocalityBase<
           TritonGPUOptimizeThreadLocalityPass> {
@@ -247,6 +400,7 @@ class TritonGPUOptimizeThreadLocalityPass
     mlir::RewritePatternSet layoutPatterns(&getContext());
     layoutPatterns.add<OptimizeReshapeLayoutPattern>(&getContext());
     layoutPatterns.add<OptimizeGatherLayoutPattern>(&getContext());
+    layoutPatterns.add<OptimizeReductionWarpLayoutPattern>(&getContext());
     if (mlir::applyPatternsGreedily(mod, std::move(layoutPatterns)).failed()) {
       signalPassFailure();
     }

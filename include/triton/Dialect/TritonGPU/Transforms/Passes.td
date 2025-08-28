@@ -277,6 +277,18 @@ def TritonGPUCoalesce: Pass<"tritongpu-coalesce", "mlir::ModuleOp"> {
 }
 
 
+def TritonGPUOptimizeWarpLayout : Pass<"tritongpu-optimize-warp-layout", "mlir::ModuleOp"> {
+  let summary = "optimize warp layout";
+
+  let description = [{
+    Optimize warpsPerCTA layouts to reduce shared memory transfers
+    when doing operations like reductions.
+  }];
+
+  let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
+                           "mlir::triton::TritonDialect"];
+}
+
 def TritonGPURemoveLayoutConversions : Pass<"tritongpu-remove-layout-conversions", "mlir::ModuleOp"> {
   let summary = "remove superfluous layout conversions";
 

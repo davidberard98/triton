@@ -24,29 +24,33 @@ public:
     m.walk([&](ReduceOp op) { reduceOps.push_back(op); });
 
     for (auto reduceOp : reduceOps) {
-      auto rankedTensorType = reduceOp->getType().dyn_cast<RankedTensorType>();
+      auto resultType = reduceOp->getResult(0).getType();
+      auto rankedTensorType = llvm::dyn_cast<RankedTensorType>(resultType);
       if (!rankedTensorType) {
         continue;
       }
 
-      if (!rankedTensorType.getEncoding().isa<BlockedEncodingAttr>()) {
+      if (!llvm::isa<BlockedEncodingAttr>(rankedTensorType.getEncoding())) {
         continue;
       }
 
-      BlockedLayoutAttribute newLayout = getNewBlockedLayout(reduceOp, rankedTensorType);
+      // BlockedEncodingAttr newLayout = getNewBlockedLayout(reduceOp,
+      // rankedTensorType);
     }
 
     // TODO: Implement warp layout optimization
   }
 
 private:
-  DenseMap<Value, Type> layouts;
+  DenseMap<Value, Attribute> layouts;
 
-  enum class AssignmentResult {Failure, NoOp, Success};
+  enum class AssignmentResult { Failure, NoOp, Success };
 
-  LogicalResult propagateBlockedLayout(Operation* initOp, BlockedLayoutAttribute oldLayout, BlockedLayoutAttribute newLayout) {
+  LogicalResult propagateBlockedLayout(Operation *initOp,
+                                       BlockedEncodingAttr oldLayout,
+                                       BlockedEncodingAttr newLayout) {
     // Extract layouts from both operands and results
-    SmallVector<Operation*> stack;
+    SmallVector<Operation *> stack;
     stack.push_back(initOp);
 
     while (!stack.empty()) {
@@ -78,50 +82,67 @@ private:
         }
       }
     }
+
+    return success();
   }
 
-  AssignmentResult assignNewLayout(Value value, BlockedLayoutAttribute oldLayout, BlockedLayoutAttribute newLayout) {
-    auto targetLayout = getNewLayout(value, oldLayout, newLayout);
+  AssignmentResult assignNewLayout(Value value, BlockedEncodingAttr oldLayout,
+                                   BlockedEncodingAttr newLayout) {
+    // Inline getNewLayout logic
+    auto ty = value.getType();
+    std::optional<Attribute> targetLayout;
+
+    if (llvm::isa<RankedTensorType>(ty)) {
+      auto tensorTy = llvm::cast<RankedTensorType>(ty);
+      auto tensorEnc = tensorTy.getEncoding();
+      if (auto blockedEnc = llvm::dyn_cast<BlockedEncodingAttr>(tensorEnc)) {
+        if (blockedEnc.getSizePerThread() == oldLayout.getSizePerThread() &&
+            blockedEnc.getWarpsPerCTA() == oldLayout.getWarpsPerCTA()) {
+          targetLayout = newLayout;
+        } else {
+          return AssignmentResult::Failure;
+        }
+      } else {
+        return AssignmentResult::Failure;
+      }
+    } else if (llvm::isa<IntegerType, PointerType>(ty)) {
+      // TODO: Handle non-tensor types - for now return failure
+      return AssignmentResult::NoOp;
+    } else {
+        return AssignmentResult::Failure;
+    }
+    
+
     if (!targetLayout.has_value()) {
       return AssignmentResult::Failure;
     }
 
-    if (auto alreadyAssigned = layouts.find(value)) {
-      if (alreadyAssigned->second != targetLayout) {
+    auto it = layouts.find(value);
+    if (it != layouts.end()) {
+      if (it->second != *targetLayout) {
         return AssignmentResult::Failure;
       }
       return AssignmentResult::NoOp;
     }
 
-    layouts[value] = targetLayout;
+    layouts[value] = *targetLayout;
     return AssignmentResult::Success;
   }
 
-  std::optional<Attribute> getNewLayout(Value val, const BlockedLayoutAttribute& oldLayout, const BlockedLayoutAttribute& newLayout) const {
-    auto ty = val.getType();
-
-    if (ty.isa<RankedTensorType>()) {
-      auto tensorTy = ty.cast<RankedTensorType>();
-      auto tensorEnc = tensorTy.getEncoding();
-      if (auto blockedEnc = tensorEnc.dyn_cast<BlockedEncodingAttr>()) {
-        if (blockedEnc.getShape() == oldLayout.getShape() &&
-            blockedEnc.getWarpsPerCTA() == oldLayout.getWarpsPerCTA()) {
-          return newLayout;
-        }
-      }
-    } else if (ty.isa<IntegerType, PointerType>()) {
-      return ty;
-    }
-    return std::nullopt;
+  BlockedEncodingAttr
+  getNewBlockedLayout(Value val, const BlockedEncodingAttr &oldLayout,
+                      const BlockedEncodingAttr &newLayout) const {
+    // TODO specifically implement the RankedTensorType / BlockedEncodingAttr
+    // case so it can be reused for slicing
+    return newLayout; // Placeholder implementation
   }
 
-  BlockedLayoutAttribute getNewBlockedLayout(Value val, const BlockedLayoutAttribute& oldLayout, const BlockedLayoutAttribute& newLayout) const {
-    // TODO specifically implement the RankedTensorType / BlockedEncodingAttr case so it can be reused for slicing
-  }
-
-  RankedTensorType getNewRankedTensorType(Value val, const RankedTensorType& oldType) {
-    auto oldEncoding = oldType.getEncoding().cast<BlockedEncodingAttr>();
+  RankedTensorType getNewRankedTensorType(Value val,
+                                          const RankedTensorType &oldType) {
+    auto oldEncoding = llvm::cast<BlockedEncodingAttr>(oldType.getEncoding());
     auto shape = oldType.getShape();
+    // TODO: implement the rest of this method
+    return oldType;
   }
 };
 
